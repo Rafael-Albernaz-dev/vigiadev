@@ -1,0 +1,33 @@
+# vigiaDev configuration (version 1)
+version: 1
+project_name: example
+compose_file: docker-compose.yml
+
+services:
+  database:
+    compose_service: database
+    ports: [5432]
+    port_policy: reuse
+    healthcheck:
+      type: tcp
+      host: 127.0.0.1
+      port: 5432
+      timeout: 30
+      interval: 0.25
+
+  api:
+    command: ["python", "-m", "example_api"]
+    depends_on: [migrate]
+    ports: [8000]
+    healthcheck:
+      type: http
+      url: http://127.0.0.1:8000/health
+      expected_status: 200
+      timeout: 30
+
+tasks:
+  migrate:
+    command: ["python", "-m", "example_api.migrate"]
+    depends_on: [database]
+    timeout: 60
+

@@ -1,0 +1,69 @@
+# ------------------------------------------------------------------------------
+# AI Agent Governance, Context & Prompts (Strictly Private / Never commit)
+# ------------------------------------------------------------------------------
+AGENTS.md
+agents.md
+AGENT.md
+agent.md
+GEMINI.md
+gemini.md
+CLAUDE.md
+claude.md
+COPILOT.md
+copilot.md
+CHATGPT.md
+chatgpt.md
+*.agent.md
+*.prompt.md
+*.llm.md
+*.instructions.md
+
+# Agent Directories & Local State
+.agents/
+.gemini/
+.codex/
+.hermes/
+.claude/
+.cursor/
+.windsurf/
+prompts/
+scratch/
+brain/
+transcripts/
+*.transcript.jsonl
+
+# Explicitly ensure core repository documentation is tracked
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!LICENSE
+
+# ------------------------------------------------------------------------------
+# Runtime, Sessions & Temporary Data
+# ------------------------------------------------------------------------------
+.vigiadev/
+/tmp/
+*.log
+*.pid
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ------------------------------------------------------------------------------
+# Python & Build Artifacts
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+uv.lock
