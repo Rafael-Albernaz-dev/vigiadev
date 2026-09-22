@@ -1,2 +1,0 @@
-"""Infrastructure adapters for vigiaDev."""
-

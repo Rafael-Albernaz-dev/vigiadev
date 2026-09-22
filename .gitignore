@@ -52,12 +52,25 @@ transcripts/
 .DS_Store
 
 # ------------------------------------------------------------------------------
-# Python & Build Artifacts
+# Go & Binary Build Artifacts
+# ------------------------------------------------------------------------------
+/bin/
+/vigiadev
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# ------------------------------------------------------------------------------
+# Python & Build Artifacts (Legacy & Caches)
 # ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 *.egg-info/
 dist/
 build/
@@ -67,3 +80,4 @@ venv/
 ENV/
 .pytest_cache/
 uv.lock
+

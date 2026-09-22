@@ -1,2 +1,0 @@
-"""EventBus-driven presentation adapters."""
-
