@@ -86,4 +86,7 @@ type ServiceRuntimeInfo struct {
 	IsRemapped   bool
 	StartTime    time.Time
 	Latency      time.Duration
+	BootDuration time.Duration
+	CPUPercent   float64
+	MemoryBytes  uint64
 }

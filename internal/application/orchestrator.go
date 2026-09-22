@@ -10,6 +10,7 @@ import (
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/process"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/telemetry"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
@@ -21,6 +22,7 @@ type Orchestrator struct {
 	Ports      *ports.PortResolver
 	Supervisor *process.Supervisor
 	Health     *health.Checker
+	Telemetry  *telemetry.Collector
 	WorkDir    string
 	RunID      string
 	manifest   *manifest.RunManifest
@@ -47,6 +49,7 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		Ports:      ports.NewPortResolver("127.0.0.1"),
 		Supervisor: process.NewSupervisor(bus),
 		Health:     health.NewChecker(),
+		Telemetry:  telemetry.NewCollector(bus, 1*time.Second),
 		WorkDir:    workDir,
 		RunID:      runID,
 		manifest: &manifest.RunManifest{
@@ -68,6 +71,17 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		_ = manifest.ReleaseLock(o.WorkDir)
 		_ = manifest.RemoveManifest(o.WorkDir)
 	}()
+
+	// Inicia amostragem de telemetria (CPU/RAM)
+	o.Telemetry.Start(ctx, func() map[string]int {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		res := make(map[string]int, len(o.manifest.Services))
+		for name, svc := range o.manifest.Services {
+			res[name] = svc.PID
+		}
+		return res
+	})
 
 	// 2. Executa onda por onda do DAG
 	for waveIdx, wave := range o.DAG.Waves {
@@ -170,6 +184,8 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		}
 	}
 
+	spawnTime := time.Now()
+
 	// Inicia o processo no supervisor POSIX
 	info, err := o.Supervisor.StartProcess(name, effectiveCmd, effectiveEnv, o.WorkDir)
 	if err != nil {
@@ -193,12 +209,15 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		}
 	}
 
+	bootDuration := time.Since(spawnTime)
+	detail := fmt.Sprintf("saudável em %dms", bootDuration.Milliseconds())
+
 	o.Bus.Publish(domain.ServiceStateChanged{
 		BaseEvent: domain.NewBaseEvent(),
 		Service:   name,
 		OldState:  domain.StateStarting,
 		NewState:  domain.StateHealthy,
-		Detail:    "saudável e pronto",
+		Detail:    detail,
 	})
 
 	return nil

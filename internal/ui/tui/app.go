@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/telemetry"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
@@ -59,6 +60,8 @@ type ServiceCardState struct {
 	OriginalPort int
 	IsRemapped   bool
 	Detail       string
+	CPUPercent   float64
+	MemoryBytes  uint64
 }
 
 // AppModel é o modelo principal do Bubble Tea.
@@ -220,6 +223,12 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			card.Port = msg.TargetPort
 			card.IsRemapped = true
 		}
+
+	case domain.TelemetryUpdated:
+		if card, ok := m.cards[msg.Service]; ok {
+			card.CPUPercent = msg.CPUPercent
+			card.MemoryBytes = msg.MemoryBytes
+		}
 	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -276,12 +285,26 @@ func (m *AppModel) View() string {
 			}
 		}
 
-		cardContent := fmt.Sprintf("%s %s%s\n%s",
+		telemetryInfo := ""
+		if card.State == domain.StateHealthy || card.State == domain.StateStarting {
+			if card.MemoryBytes > 0 || card.CPUPercent > 0 {
+				telemetryInfo = fmt.Sprintf(" • %s • %s",
+					telemetry.FormatCPU(card.CPUPercent),
+					telemetry.FormatBytes(card.MemoryBytes),
+				)
+			}
+		}
+
+		cardContent := fmt.Sprintf("%s %s%s\n%s%s",
 			icon,
 			lipgloss.NewStyle().Bold(true).Render(card.Name),
 			portInfo,
 			lipgloss.NewStyle().Foreground(stateColor).Render(string(card.State)),
+			telemetryInfo,
 		)
+		if card.Detail != "" && card.State == domain.StateHealthy {
+			cardContent += fmt.Sprintf("\n%s", lipgloss.NewStyle().Foreground(subtleColor).Render(card.Detail))
+		}
 
 		cardsRow.WriteString(cardBorder.Render(cardContent))
 	}
