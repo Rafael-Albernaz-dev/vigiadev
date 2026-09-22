@@ -18,6 +18,7 @@ from vigiadev.domain.events import (
     HealthcheckCompleted,
     LogReceived,
     PhaseChanged,
+    PortRemapped,
     ServiceStatusChanged,
 )
 from vigiadev.domain.states import GlobalState, ServiceState
@@ -88,10 +89,13 @@ async def test_textual_tabs_status_and_shortcuts() -> None:
         await bus.publish(
             HealthcheckCompleted(service="api", success=True, latency_ms=12.5)
         )
+        await bus.publish(
+            PortRemapped(service="api", original_port=8000, target_port=8001)
+        )
         await bus.publish(LogReceived(service="api", message="ready"))
         status = str(app.query_one("#status", Static).render())
         assert "api" in status
-        assert "8000" in status
+        assert "8000 ➔ 8001 [REMAP]" in status
         assert "12.5ms" in status
 
         app.query_one("#logs", TabbedContent).active = "service-0"

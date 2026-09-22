@@ -10,8 +10,10 @@ from vigiadev.domain.errors import HealthcheckError, PortConflictError, ProcessE
 from vigiadev.domain.events import (
     EventBus,
     HealthcheckCompleted,
+    LogReceived,
     PhaseChanged,
     PortConflictDetected,
+    PortRemapped,
     ServiceStatusChanged,
     ShutdownStarted,
     TaskCompleted,
@@ -49,6 +51,13 @@ class Orchestrator:
         self._stopping = False
         self._stop_requested = False
         self._started = False
+        self.effective_ports: dict[str, list[int]] = {
+            name: list(service.ports) for name, service in config.services.items()
+        }
+        self.port_remappings: dict[str, dict[int, int]] = {}
+        self._reserved_ports = {
+            port for service in config.services.values() for port in service.ports
+        }
         self.supervisor.on_started = self._process_started
         self.supervisor.on_stopped = self._process_stopped
 
@@ -219,7 +228,68 @@ class Orchestrator:
                 f"service {name!r} requires interactive port confirmation; use fail, reuse, or explicit kill"
             )
         if service.port_policy is PortPolicy.REMAP:
-            raise PortConflictError(f"automatic port remapping is not available in MVP 1 for {name!r}")
+            remappings: dict[int, int] = {}
+            for inspection in occupied:
+                target = self.ports.find_available_port(inspection.port)
+                while target in self._reserved_ports:
+                    remaining = 50 - (target - inspection.port)
+                    if remaining <= 0:
+                        raise PortConflictError(
+                            f"no unreserved port found within 50 attempts "
+                            f"following port {inspection.port}"
+                        )
+                    target = self.ports.find_available_port(
+                        target, max_attempts=remaining
+                    )
+                remappings[inspection.port] = target
+                self._reserved_ports.add(target)
+                await self.event_bus.publish(
+                    PortRemapped(
+                        service=name,
+                        original_port=inspection.port,
+                        target_port=target,
+                    )
+                )
+
+            primary_port = remappings[occupied[0].port]
+            command_declares_port = bool(
+                service.command
+                and any("{port}" in argument for argument in service.command)
+            )
+            env_declares_port = any("{port}" in value for value in service.env.values())
+            service.command = (
+                [argument.replace("{port}", str(primary_port)) for argument in service.command]
+                if service.command is not None
+                else None
+            )
+            service.env = {
+                key: value.replace("{port}", str(primary_port))
+                for key, value in service.env.items()
+            }
+            if service.healthcheck is not None:
+                health_updates: dict[str, object] = {}
+                if service.healthcheck.url is not None:
+                    health_updates["url"] = service.healthcheck.url.replace(
+                        "{port}", str(primary_port)
+                    )
+                if service.healthcheck.port in remappings:
+                    health_updates["port"] = remappings[service.healthcheck.port]
+                service.healthcheck = service.healthcheck.model_copy(update=health_updates)
+            service.ports = [remappings.get(port, port) for port in service.ports]
+            self.effective_ports[name] = list(service.ports)
+            self.port_remappings[name] = remappings
+            if not command_declares_port and not env_declares_port:
+                await self.event_bus.publish(
+                    LogReceived(
+                        service=name,
+                        stream="stderr",
+                        message=(
+                            "port remapped but {port} is absent from command and env; "
+                            "the process may still bind its original port"
+                        ),
+                    )
+                )
+            return False
         raise PortConflictError(f"port already occupied for service {name!r}")
 
     async def _wait_for_health(self, name: str, service: ServiceConfig) -> None:

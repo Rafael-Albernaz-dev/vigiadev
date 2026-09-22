@@ -16,6 +16,7 @@ from vigiadev.domain.events import (
     HealthcheckCompleted,
     LogReceived,
     PhaseChanged,
+    PortRemapped,
     ServiceStatusChanged,
 )
 from vigiadev.domain.states import ServiceState
@@ -58,6 +59,9 @@ class VigiaDevApp(App[None]):
         self.service_states = {name: ServiceState.DEFINED for name in self.services}
         self.service_latency: dict[str, float | None] = {
             name: None for name in self.services
+        }
+        self.port_remappings: dict[str, list[tuple[int, int]]] = {
+            name: [] for name in self.services
         }
         self._tab_ids = {
             name: f"service-{index}" for index, name in enumerate(self.services)
@@ -106,6 +110,16 @@ class VigiaDevApp(App[None]):
             if self._mounted_ready:
                 self.sub_title = f"{event.service}: {event.latency_ms:.1f}ms"
             self._render_status()
+        elif isinstance(event, PortRemapped):
+            self.port_remappings.setdefault(event.service, []).append(
+                (event.original_port, event.target_port)
+            )
+            ports = self.service_ports.get(event.service, ())
+            self.service_ports[event.service] = tuple(
+                event.target_port if port == event.original_port else port
+                for port in ports
+            )
+            self._render_status()
         elif isinstance(event, LogReceived):
             self._write_log(event)
 
@@ -152,6 +166,10 @@ class VigiaDevApp(App[None]):
             text.append(f"{icon} {name} ", style=color)
             text.append(state.value, style="dim")
             details: list[str] = []
+            details.extend(
+                f"{original} ➔ {target} [REMAP]"
+                for original, target in self.port_remappings.get(name, [])
+            )
             if ports := self.service_ports[name]:
                 details.append("ports " + ",".join(str(port) for port in ports))
             if (latency := self.service_latency[name]) is not None:

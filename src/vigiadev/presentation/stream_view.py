@@ -9,6 +9,7 @@ from vigiadev.domain.events import (
     LogReceived,
     PhaseChanged,
     PortConflictDetected,
+    PortRemapped,
     ProcessExited,
     ServiceStatusChanged,
     ShutdownStarted,
@@ -56,6 +57,11 @@ class StreamView:
             self.console.print(
                 f"[yellow]{timestamp} port {event.port} occupied for {event.service} "
                 f"(pid={event.pid or 'unknown'}, policy={event.policy})[/]"
+            )
+        elif isinstance(event, PortRemapped):
+            self.console.print(
+                f"[yellow]{timestamp} {event.service}: {event.original_port} "
+                f"➔ {event.target_port} [REMAP][/]"
             )
         elif isinstance(event, TaskCompleted):
             self.console.print(

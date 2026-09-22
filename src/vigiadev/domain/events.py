@@ -51,6 +51,13 @@ class PortConflictDetected(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class PortRemapped(Event):
+    service: str = ""
+    original_port: int = 0
+    target_port: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class TaskCompleted(Event):
     task: str = ""
     exit_code: int = 0

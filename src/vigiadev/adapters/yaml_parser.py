@@ -44,3 +44,14 @@ def load_config(project_root: Path, explicit: str | Path | None = None) -> tuple
         raise ConfigurationError(f"invalid configuration {path}:\n{error}") from error
     return path, config
 
+
+def dump_config(config: VigiaConfig, *, comments: list[str] | None = None) -> str:
+    header = ["# vigiaDev configuration (version 1)"]
+    header.extend(f"# {comment}" for comment in comments or [])
+    payload = yaml.safe_dump(
+        config.model_dump(mode="json", exclude_none=True),
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    return "\n".join(header) + "\n" + payload
+

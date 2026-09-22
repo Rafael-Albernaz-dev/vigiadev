@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from io import StringIO
@@ -8,6 +9,8 @@ from pathlib import Path
 from rich.console import Console
 
 from vigiadev.cli import main
+from vigiadev.domain.events import EventBus, PortRemapped
+from vigiadev.presentation.stream_view import StreamView
 
 
 def test_headless_run_with_real_short_lived_service(tmp_path: Path) -> None:
@@ -32,3 +35,20 @@ def test_headless_run_with_real_short_lived_service(tmp_path: Path) -> None:
     assert "stopped" in output
     assert not (tmp_path / ".vigiadev" / "run.json").exists()
     assert not (tmp_path / ".vigiadev" / "vigiadev.lock").exists()
+
+
+def test_stream_view_renders_port_remap_badge() -> None:
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None)
+    bus = EventBus()
+    view = StreamView(bus, console)
+    try:
+        asyncio.run(
+            bus.publish(
+                PortRemapped(service="api", original_port=3000, target_port=3001)
+            )
+        )
+    finally:
+        view.close()
+
+    assert "api: 3000 ➔ 3001 [REMAP]" in stream.getvalue()

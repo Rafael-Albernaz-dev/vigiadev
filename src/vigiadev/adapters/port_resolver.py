@@ -36,6 +36,23 @@ class PortResolver:
             return "remap"
         return "fail"
 
+    def find_available_port(
+        self,
+        start_port: int,
+        host: str = "127.0.0.1",
+        max_attempts: int = 50,
+    ) -> int:
+        for offset in range(1, max_attempts + 1):
+            candidate = start_port + offset
+            if candidate > 65535:
+                break
+            if not self.inspect(candidate, host).occupied:
+                return candidate
+        raise PortConflictError(
+            f"no available port found after {max_attempts} attempts "
+            f"following port {start_port} on {host}"
+        )
+
     async def terminate_listener(
         self, inspection: PortInspection, timeout: float = 5.0
     ) -> None:

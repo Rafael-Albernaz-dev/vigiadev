@@ -12,49 +12,30 @@ from pathlib import Path
 from typing import Sequence
 
 from rich.console import Console
+from rich.table import Table
 
 from vigiadev.adapters.compose_v2 import ComposeV2
 from vigiadev.adapters.health import HealthChecker
 from vigiadev.adapters.port_resolver import PortResolver
 from vigiadev.adapters.session_manifest import SessionManifest
-from vigiadev.adapters.yaml_parser import load_config
+from vigiadev.adapters.stack_detector import StackDetector
+from vigiadev.adapters.yaml_parser import CONFIG_CANDIDATES, load_config
 from vigiadev.application.orchestrator import Orchestrator
 from vigiadev.application.supervisor import ProcessSupervisor
 from vigiadev.domain.errors import VigiaDevError
 from vigiadev.domain.events import EventBus
+from vigiadev.domain.models import VigiaConfig
 from vigiadev.presentation.stream_view import StreamView
 from vigiadev.presentation.textual_app import VigiaDevApp
 
 
-CANONICAL_TEMPLATE = """# vigiaDev configuration (version 1)
-version: 1
-project_name: my-project
-
-# Set compose_file when at least one service uses compose_service.
-# compose_file: docker-compose.yml
-
-services:
-  app:
-    command: [\"python\", \"-m\", \"my_app\"]
-    ports: [8000]
-    port_policy: reuse  # reuse | prompt | remap | fail | kill
-    healthcheck:
-      type: http
-      url: http://127.0.0.1:8000/health
-      expected_status: 200
-      timeout: 30
-      interval: 0.25
-
-# Provisioning tasks are DAG nodes and run once after their dependencies.
-tasks: {}
-"""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vigiadev")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="create a canonical vigiadev.yaml")
+    init_parser = subparsers.add_parser("init", help="detect the stack and create vigiadev.yaml")
     init_parser.add_argument("--force", action="store_true", help="overwrite an existing file")
 
     up_parser = subparsers.add_parser("up", help="start the development environment")
@@ -114,7 +95,8 @@ def _init(root: Path, force: bool, console: Console) -> int:
     target = root / "vigiadev.yaml"
     if target.exists() and not force:
         raise VigiaDevError(f"{target} already exists; pass --force to overwrite it")
-    target.write_text(CANONICAL_TEMPLATE, encoding="utf-8")
+    detector = StackDetector(root)
+    target.write_text(detector.to_yaml(), encoding="utf-8")
     console.print(f"[green]created[/] {target}")
     return 0
 
@@ -155,7 +137,19 @@ async def _up(
     kill_ports: bool,
     console: Console,
 ) -> int:
-    _, config = load_config(root, explicit_config)
+    has_default_config = any((root / name).is_file() for name in CONFIG_CANDIDATES)
+    if explicit_config is None and not has_default_config:
+        detector = StackDetector(root)
+        config = detector.detect()
+        _print_detected_services(config, console)
+        if not _confirm_detected_config(console):
+            console.print("[yellow]cancelled[/] no configuration was written")
+            return 1
+        target = root / "vigiadev.yaml"
+        target.write_text(detector.to_yaml(), encoding="utf-8")
+        console.print(f"[green]created[/] {target}")
+    else:
+        _, config = load_config(root, explicit_config)
     bus = EventBus()
     supervisor = ProcessSupervisor(bus)
     manifest = SessionManifest(root)
@@ -190,6 +184,41 @@ async def _up(
     )
     await _run_tui(app, orchestrator)
     return 0
+
+
+def _print_detected_services(config: VigiaConfig, console: Console) -> None:
+    table = Table(title="Serviços detectados")
+    table.add_column("Serviço")
+    table.add_column("Execução")
+    table.add_column("Portas")
+    table.add_column("Política")
+    for name, service in config.services.items():
+        runner = (
+            " ".join(service.command)
+            if service.command is not None
+            else f"compose:{service.compose_service}"
+        )
+        table.add_row(
+            name,
+            runner,
+            ", ".join(str(port) for port in service.ports) or "—",
+            service.port_policy.value,
+        )
+    if not config.services:
+        table.add_row("—", "nenhum serviço conhecido", "—", "—")
+    console.print(table)
+
+
+def _confirm_detected_config(console: Console) -> bool:
+    try:
+        answer = console.input(
+            "Gravar as sugestões em vigiadev.yaml e iniciar? [S/n] "
+        )
+    except EOFError as error:
+        raise VigiaDevError(
+            "interactive confirmation is required to create vigiadev.yaml"
+        ) from error
+    return answer.strip().lower() in {"", "s", "sim", "y", "yes"}
 
 
 async def _run_headless(orchestrator: Orchestrator) -> None:

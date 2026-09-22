@@ -10,7 +10,9 @@ from pathlib import Path
 
 from rich.console import Console
 
+import vigiadev.cli as cli_module
 from vigiadev.adapters.session_manifest import SessionManifest
+from vigiadev.adapters.yaml_parser import load_config
 from vigiadev.cli import main
 
 
@@ -67,3 +69,49 @@ def test_down_stops_only_process_recorded_by_manifest(tmp_path: Path) -> None:
             os.killpg(os.getpgid(child.pid), signal.SIGTERM)
             child.wait(timeout=2)
 
+
+
+def test_init_detected_stack(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}',
+        encoding="utf-8",
+    )
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+
+    assert main(["init"], cwd=tmp_path, console=console) == 0
+
+    _, config = load_config(tmp_path)
+    assert config.services["app"].command == [
+        "npm",
+        "run",
+        "dev",
+        "--",
+        "--port",
+        "{port}",
+    ]
+    assert config.services["app"].ports == [5173]
+
+
+def test_up_auto_detect_interactive(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}',
+        encoding="utf-8",
+    )
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None)
+    booted = []
+
+    async def fake_run_headless(orchestrator) -> None:
+        booted.append(orchestrator.config)
+
+    monkeypatch.setattr(cli_module, "_run_headless", fake_run_headless)
+    monkeypatch.setattr("builtins.input", lambda: "")
+
+    assert main(["up", "--no-tui"], cwd=tmp_path, console=console) == 0
+
+    assert (tmp_path / "vigiadev.yaml").is_file()
+    assert len(booted) == 1
+    assert booted[0].services["app"].ports == [5173]
+    output = stream.getvalue()
+    assert "Serviços detectados" in output
+    assert "Gravar as sugestões" in output
