@@ -2,13 +2,17 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/detector"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/ui/stream"
@@ -31,7 +35,43 @@ var upCmd = &cobra.Command{
 
 		cfgPath, err := config.FindConfigFile(cwd, cfgFile)
 		if err != nil {
-			return fmt.Errorf("nenhum arquivo de configuração encontrado: %w\n(Execute 'vigiadev init' ou passe -c <arquivo>)", err)
+			if errors.Is(err, config.ErrConfigNotFound) && cfgFile == "" {
+				fmt.Println("⚠️ Nenhum arquivo de configuração encontrado.")
+				fmt.Println("🔍 Analisando stack do repositório local...")
+
+				d := detector.NewStackDetector(cwd)
+				result, detectErr := d.Detect()
+				if detectErr == nil && len(result.Config.Services) > 0 {
+					fmt.Println("\n📦 O vigiaDev detectou os seguintes serviços:")
+					for name, svc := range result.Config.Services {
+						if len(svc.Command) > 0 {
+							fmt.Printf("  • %s: %v (portas: %v)\n", name, svc.Command, svc.Ports)
+						} else {
+							fmt.Printf("  • %s: compose_service '%s'\n", name, svc.ComposeService)
+						}
+					}
+
+					fmt.Print("\n❓ Deseja salvar 'vigiadev.yaml' e iniciar agora? [S/n]: ")
+					var answer string
+					_, _ = fmt.Scanln(&answer)
+					answer = strings.TrimSpace(strings.ToLower(answer))
+
+					if answer == "" || answer == "s" || answer == "sim" || answer == "y" || answer == "yes" {
+						yamlContent, _ := detector.GenerateYAML(result.Config, result.Markers)
+						_ = os.WriteFile(filepath.Join(cwd, "vigiadev.yaml"), []byte(yamlContent), 0644)
+						cfgPath = filepath.Join(cwd, "vigiadev.yaml")
+						fmt.Println("✨ 'vigiadev.yaml' gerado com sucesso! Iniciando ambiente...")
+						fmt.Println()
+					} else {
+						fmt.Println("Operação cancelada.")
+						return nil
+					}
+				} else {
+					return fmt.Errorf("nenhum arquivo de configuração encontrado e nenhuma stack padrão detectada.\nExecute 'vigiadev init' para criar um modelo inicial")
+				}
+			} else {
+				return fmt.Errorf("nenhum arquivo de configuração encontrado: %w\n(Execute 'vigiadev init' ou passe -c <arquivo>)", err)
+			}
 		}
 
 		cfg, err := config.LoadConfig(cfgPath)
