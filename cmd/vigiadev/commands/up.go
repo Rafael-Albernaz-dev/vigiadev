@@ -81,8 +81,12 @@ var upCmd = &cobra.Command{
 
 		serviceNames := orch.DAG.LinearOrder
 
+		restartFunc := func(service string) error {
+			return orch.RestartService(ctx, service)
+		}
+
 		// Executa a TUI (com suporte a mouse, cliques e teclado)
-		if err := tui.RunTUI(ctx, cfg.ProjectName, serviceNames, bus, cancel); err != nil {
+		if err := tui.RunTUI(ctx, cfg.ProjectName, serviceNames, bus, cancel, restartFunc); err != nil {
 			cancel()
 			return err
 		}

@@ -53,12 +53,15 @@ type LogLineProduced struct {
 
 func (e LogLineProduced) EventName() string { return "log.line_produced" }
 
-// TelemetryUpdated transporta métricas de consumo de CPU e RAM coletadas periodicamente.
+// TelemetryUpdated transporta métricas de consumo de CPU, RAM, Disco e latência.
 type TelemetryUpdated struct {
 	BaseEvent
-	Service     string
-	CPUPercent  float64
-	MemoryBytes uint64
+	Service        string
+	CPUPercent     float64
+	MemoryBytes    uint64
+	DiskReadBytes  uint64
+	DiskWriteBytes uint64
+	ResponseTime   time.Duration
 }
 
 func (e TelemetryUpdated) EventName() string { return "telemetry.updated" }

@@ -96,19 +96,57 @@ func ReadProcessCPUTicks(pid int) (uint64, error) {
 	return utime + stime, nil
 }
 
-// SampleService coleta uma amostra instantânea de CPU e RAM para o serviço.
-func (c *Collector) SampleService(service string, pid int) (float64, uint64, error) {
+// ReadProcessDiskIO lê os bytes lidos e gravados em disco pelo processo a partir de /proc/<pid>/io.
+func ReadProcessDiskIO(pid int) (uint64, uint64, error) {
+	if pid <= 0 {
+		return 0, 0, nil
+	}
+
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/io", pid))
+	if err != nil {
+		return 0, 0, nil // Fallback gracioso caso permissões de kernel restrinjam
+	}
+
+	var readBytes, writeBytes uint64
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val, _ := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+			if key == "read_bytes" {
+				readBytes = val
+			} else if key == "write_bytes" {
+				writeBytes = val
+			}
+		}
+	}
+
+	return readBytes, writeBytes, nil
+}
+
+// ProcessMetrics agrupa as medições de um processo no SO.
+type ProcessMetrics struct {
+	CPUPercent     float64
+	MemoryBytes    uint64
+	DiskReadBytes  uint64
+	DiskWriteBytes uint64
+}
+
+// SampleService coleta uma amostra instantânea de CPU, RAM e Disco para o serviço.
+func (c *Collector) SampleService(service string, pid int) (*ProcessMetrics, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	mem, err := ReadProcessMemory(pid)
-	if err != nil {
-		return 0, 0, err
-	}
-
+	mem, _ := ReadProcessMemory(pid)
+	readBytes, writeBytes, _ := ReadProcessDiskIO(pid)
 	ticks, err := ReadProcessCPUTicks(pid)
 	if err != nil {
-		return 0, mem, err
+		return &ProcessMetrics{
+			MemoryBytes:    mem,
+			DiskReadBytes:  readBytes,
+			DiskWriteBytes: writeBytes,
+		}, err
 	}
 
 	now := time.Now()
@@ -120,7 +158,6 @@ func (c *Collector) SampleService(service string, pid int) (float64, uint64, err
 		deltaTime := now.Sub(sampler.LastTime).Seconds()
 
 		if deltaTime > 0 && deltaTicks >= 0 {
-			// CLK_TCK no Linux é 100 ticks por segundo
 			cpuSeconds := deltaTicks / 100.0
 			cpuPercent = (cpuSeconds / deltaTime) * 100.0
 		}
@@ -131,7 +168,12 @@ func (c *Collector) SampleService(service string, pid int) (float64, uint64, err
 	c.samplers[service].LastTicks = ticks
 	c.samplers[service].LastTime = now
 
-	return cpuPercent, mem, nil
+	return &ProcessMetrics{
+		CPUPercent:     cpuPercent,
+		MemoryBytes:    mem,
+		DiskReadBytes:  readBytes,
+		DiskWriteBytes: writeBytes,
+	}, nil
 }
 
 // Start inicia o loop periódico de amostragem em segundo plano.
@@ -151,13 +193,15 @@ func (c *Collector) Start(ctx context.Context, getProcesses func() map[string]in
 					if pid <= 0 {
 						continue
 					}
-					cpu, mem, err := c.SampleService(service, pid)
+					metrics, err := c.SampleService(service, pid)
 					if err == nil && c.publisher != nil {
 						c.publisher.Publish(domain.TelemetryUpdated{
-							BaseEvent:   domain.NewBaseEvent(),
-							Service:     service,
-							CPUPercent:  cpu,
-							MemoryBytes: mem,
+							BaseEvent:      domain.NewBaseEvent(),
+							Service:        service,
+							CPUPercent:     metrics.CPUPercent,
+							MemoryBytes:    metrics.MemoryBytes,
+							DiskReadBytes:  metrics.DiskReadBytes,
+							DiskWriteBytes: metrics.DiskWriteBytes,
 						})
 					}
 				}

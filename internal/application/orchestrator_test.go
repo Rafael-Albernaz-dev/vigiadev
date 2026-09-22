@@ -153,3 +153,60 @@ func TestOrchestrator_PortRemap(t *testing.T) {
 		t.Errorf("esperava porta remapeada maior que %d, obteve %d", busyPort, remappedEvents[0].TargetPort)
 	}
 }
+
+func TestOrchestrator_RestartService(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "test-restart",
+		Services: map[string]domain.ServiceConfig{
+			"worker": {
+				Command: []string{"sh", "-c", "sleep 10"},
+				HealthCheck: &domain.HealthCheckConfig{
+					Type:       domain.HealthCheckCommand,
+					Command:    []string{"sh", "-c", "exit 0"},
+					IntervalMs: 50,
+					TimeoutMs:  200,
+					Retries:    5,
+				},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = orch.Run(ctx)
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+
+	m1, err := manifest.ReadManifest(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialPID := m1.Services["worker"].PID
+
+	// Reinicia o serviço individual
+	if err := orch.RestartService(ctx, "worker"); err != nil {
+		t.Fatalf("falha ao reiniciar serviço: %v", err)
+	}
+
+	m2, err := manifest.ReadManifest(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPID := m2.Services["worker"].PID
+
+	if newPID == initialPID || newPID <= 0 {
+		t.Fatalf("esperava novo PID diferente do anterior (%d), obteve %d", initialPID, newPID)
+	}
+}

@@ -202,15 +202,18 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 	}
 	o.mu.Unlock()
 
+	var probeLatency time.Duration
 	// Healthcheck de prontidão
 	if svc.HealthCheck != nil {
-		if err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1"); err != nil {
+		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
+		if err != nil {
 			return fmt.Errorf("serviço '%s' falhou no healthcheck: %w", name, err)
 		}
+		probeLatency = lat
 	}
 
 	bootDuration := time.Since(spawnTime)
-	detail := fmt.Sprintf("saudável em %dms", bootDuration.Milliseconds())
+	detail := fmt.Sprintf("saudável em %dms (latência: %dms)", bootDuration.Milliseconds(), probeLatency.Milliseconds())
 
 	o.Bus.Publish(domain.ServiceStateChanged{
 		BaseEvent: domain.NewBaseEvent(),
@@ -219,6 +222,44 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		NewState:  domain.StateHealthy,
 		Detail:    detail,
 	})
+
+	return nil
+}
+
+// RestartService reinicia sob demanda um único serviço sem interromper o restante do ambiente.
+func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
+	svc, exists := o.Config.Services[name]
+	if !exists {
+		return fmt.Errorf("serviço '%s' não encontrado", name)
+	}
+
+	o.Bus.Publish(domain.ServiceStateChanged{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		OldState:  domain.StateHealthy,
+		NewState:  domain.StateStarting,
+		Detail:    "reiniciando sob demanda...",
+	})
+
+	o.Bus.Publish(domain.LogLineProduced{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		Line:      fmt.Sprintf("[vigiadev] Reiniciando serviço '%s'...", name),
+		IsError:   false,
+	})
+
+	// 1. Encerra o processo atual no supervisor
+	_ = o.Supervisor.StopProcess(name, 2*time.Second)
+
+	// 2. Inicia novamente com alocação e healthcheck
+	if err := o.startService(ctx, name, svc); err != nil {
+		return fmt.Errorf("falha ao reiniciar serviço '%s': %w", name, err)
+	}
+
+	// 3. Atualiza o manifesto de sessão
+	o.mu.Lock()
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+	o.mu.Unlock()
 
 	return nil
 }

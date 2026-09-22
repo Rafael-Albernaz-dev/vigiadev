@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -52,16 +53,19 @@ var (
 			Padding(0, 1)
 )
 
-// ServiceCardState armazena os metadados visuais de cada serviço no card superior.
+// ServiceCardState armazena os metadados visuais de cada serviço no card superior e telemetria profunda.
 type ServiceCardState struct {
-	Name         string
-	State        domain.ServiceState
-	Port         int
-	OriginalPort int
-	IsRemapped   bool
-	Detail       string
-	CPUPercent   float64
-	MemoryBytes  uint64
+	Name           string
+	State          domain.ServiceState
+	Port           int
+	OriginalPort   int
+	IsRemapped     bool
+	Detail         string
+	CPUPercent     float64
+	MemoryBytes    uint64
+	DiskReadBytes  uint64
+	DiskWriteBytes uint64
+	ResponseTime   time.Duration
 }
 
 // AppModel é o modelo principal do Bubble Tea.
@@ -78,11 +82,15 @@ type AppModel struct {
 	ready       bool
 	bus         *domain.EventBus
 	cancel      context.CancelFunc
+	restartFunc func(service string) error
+	statusMsg   string
 }
 
-// NewAppModel instancia o modelo da TUI interativa.
-func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc) *AppModel {
+// NewAppModel instancia o modelo da TUI interativa com suporte a aba de métricas e restart.
+func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) *AppModel {
 	tabs := append([]string{"ALL"}, serviceNames...)
+	tabs = append(tabs, "📊 MÉTRICAS")
+
 	cards := make(map[string]*ServiceCardState)
 	logs := make(map[string][]string)
 
@@ -104,6 +112,7 @@ func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus
 		logs:        logs,
 		bus:         bus,
 		cancel:      cancel,
+		restartFunc: restartFunc,
 	}
 }
 
@@ -134,14 +143,26 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = (m.activeTab - 1 + len(m.tabs)) % len(m.tabs)
 			m.syncViewport()
 
+		case "r":
+			// Reinicia o serviço focado na aba atual
+			currentTab := m.tabs[m.activeTab]
+			if currentTab != "ALL" && currentTab != "📊 MÉTRICAS" && m.restartFunc != nil {
+				m.statusMsg = fmt.Sprintf("Reiniciando serviço '%s'...", currentTab)
+				go func(svc string) {
+					_ = m.restartFunc(svc)
+				}(currentTab)
+			}
+
 		case "c":
 			// Limpa logs da aba ativa
 			currentTab := m.tabs[m.activeTab]
-			m.logs[currentTab] = make([]string, 0)
-			m.syncViewport()
+			if currentTab != "📊 MÉTRICAS" {
+				m.logs[currentTab] = make([]string, 0)
+				m.syncViewport()
+			}
 
 		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-			idx := int(msg.String()[0]-'1')
+			idx := int(msg.String()[0] - '1')
 			if idx < len(m.tabs) {
 				m.activeTab = idx
 				m.syncViewport()
@@ -149,18 +170,17 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		// Suporte a cliques do mouse e rolagem da roda
 		switch msg.Type {
 		case tea.MouseWheelUp:
 			m.viewport.LineUp(3)
 		case tea.MouseWheelDown:
 			m.viewport.LineDown(3)
 		case tea.MouseLeft:
-			// Clique nas abas (linha 4 aproximadamente)
-			if msg.Y >= 3 && msg.Y <= 5 {
+			// Clique nas abas
+			if msg.Y >= 3 && msg.Y <= 6 {
 				xOffset := 1
 				for i, tab := range m.tabs {
-					tabWidth := len(tab) + 4 // padding + margin
+					tabWidth := len(tab) + 4
 					if msg.X >= xOffset && msg.X <= xOffset+tabWidth {
 						m.activeTab = i
 						m.syncViewport()
@@ -199,7 +219,6 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			line = lipgloss.NewStyle().Foreground(errorColor).Render(line)
 		}
 
-		// Adiciona ao buffer ALL e ao buffer específico do serviço
 		m.logs["ALL"] = append(m.logs["ALL"], line)
 		if _, exists := m.logs[msg.Service]; exists {
 			m.logs[msg.Service] = append(m.logs[msg.Service], line)
@@ -216,6 +235,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			card.State = msg.NewState
 			card.Detail = msg.Detail
 		}
+		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+			m.syncViewport()
+		}
 
 	case domain.PortRemapped:
 		if card, ok := m.cards[msg.Service]; ok {
@@ -223,11 +245,22 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			card.Port = msg.TargetPort
 			card.IsRemapped = true
 		}
+		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+			m.syncViewport()
+		}
 
 	case domain.TelemetryUpdated:
 		if card, ok := m.cards[msg.Service]; ok {
 			card.CPUPercent = msg.CPUPercent
 			card.MemoryBytes = msg.MemoryBytes
+			card.DiskReadBytes = msg.DiskReadBytes
+			card.DiskWriteBytes = msg.DiskWriteBytes
+			if msg.ResponseTime > 0 {
+				card.ResponseTime = msg.ResponseTime
+			}
+		}
+		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+			m.syncViewport()
 		}
 	}
 
@@ -239,9 +272,88 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *AppModel) syncViewport() {
 	currentTab := m.tabs[m.activeTab]
+	if currentTab == "📊 MÉTRICAS" {
+		m.viewport.SetContent(m.renderMetricsDashboard())
+		return
+	}
 	lines := m.logs[currentTab]
 	content := strings.Join(lines, "\n")
 	m.viewport.SetContent(content)
+}
+
+func (m *AppModel) renderMetricsDashboard() string {
+	var b strings.Builder
+
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(accentColor).
+		Padding(0, 1)
+
+	b.WriteString(headerStyle.Render(" PAINEL COMPLETO DE TELEMETRIA E RECURSOS DO SISTEMA ") + "\n\n")
+
+	metricBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accentColor).
+		Padding(1, 2).
+		MarginBottom(1)
+
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#C0C0C0")).Width(24)
+	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+
+	for _, name := range m.services {
+		card := m.cards[name]
+
+		var content strings.Builder
+		content.WriteString(lipgloss.NewStyle().Bold(true).Foreground(highlightColor).Render(fmt.Sprintf("SERVIÇO: %s", strings.ToUpper(name))) + "\n")
+		content.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(strings.Repeat("─", 65)) + "\n")
+
+		// Status
+		icon := "⚪"
+		switch card.State {
+		case domain.StateHealthy:
+			icon = "🟢"
+		case domain.StateStarting:
+			icon = "🟡"
+		case domain.StateFailed:
+			icon = "🔴"
+		case domain.StateStopped:
+			icon = "⏹️"
+		}
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Status Operacional:"), fmt.Sprintf("%s %s (%s)", icon, card.State, card.Detail)))
+
+		// Porta
+		portStr := "nenhuma porta declarada"
+		if card.Port > 0 {
+			if card.IsRemapped {
+				portStr = fmt.Sprintf("%d ➔ %d [REMAPEAMENTO ATIVO]", card.OriginalPort, card.Port)
+			} else {
+				portStr = fmt.Sprintf("%d (estável)", card.Port)
+			}
+		}
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Porta de Rede (TCP):"), valStyle.Render(portStr)))
+
+		// CPU
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Uso de Processador:"), valStyle.Render(telemetry.FormatCPU(card.CPUPercent))))
+
+		// Memória RAM
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Uso de Memória RAM:"), valStyle.Render(fmt.Sprintf("%s (Resident Set Size)", telemetry.FormatBytes(card.MemoryBytes)))))
+
+		// E/S de Disco
+		diskStr := fmt.Sprintf("Leitura: %s  •  Escrita: %s", telemetry.FormatBytes(card.DiskReadBytes), telemetry.FormatBytes(card.DiskWriteBytes))
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("E/S de Disco (I/O):"), valStyle.Render(diskStr)))
+
+		// Tempo de Resposta
+		probeStr := "medindo latência do probe..."
+		if card.Detail != "" && strings.Contains(card.Detail, "latência:") {
+			probeStr = card.Detail
+		}
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tempo de Resposta:"), valStyle.Render(probeStr)))
+
+		b.WriteString(metricBox.Render(content.String()) + "\n")
+	}
+
+	return b.String()
 }
 
 func (m *AppModel) View() string {
@@ -255,7 +367,7 @@ func (m *AppModel) View() string {
 	header := titleStyle.Render(fmt.Sprintf(" vigiaDev — %s ", m.ProjectName))
 	b.WriteString(header + "\n\n")
 
-	// 2. Cards Superiores de Status
+	// 2. Cards Superiores Limpos e Elegantes (Status + Porta)
 	var cardsRow strings.Builder
 	for _, name := range m.services {
 		card := m.cards[name]
@@ -285,36 +397,25 @@ func (m *AppModel) View() string {
 			}
 		}
 
-		telemetryInfo := ""
-		if card.State == domain.StateHealthy || card.State == domain.StateStarting {
-			if card.MemoryBytes > 0 || card.CPUPercent > 0 {
-				telemetryInfo = fmt.Sprintf(" • %s • %s",
-					telemetry.FormatCPU(card.CPUPercent),
-					telemetry.FormatBytes(card.MemoryBytes),
-				)
-			}
-		}
-
-		cardContent := fmt.Sprintf("%s %s%s\n%s%s",
+		cardContent := fmt.Sprintf("%s %s%s\n%s",
 			icon,
 			lipgloss.NewStyle().Bold(true).Render(card.Name),
 			portInfo,
 			lipgloss.NewStyle().Foreground(stateColor).Render(string(card.State)),
-			telemetryInfo,
 		)
-		if card.Detail != "" && card.State == domain.StateHealthy {
-			cardContent += fmt.Sprintf("\n%s", lipgloss.NewStyle().Foreground(subtleColor).Render(card.Detail))
-		}
 
 		cardsRow.WriteString(cardBorder.Render(cardContent))
 	}
 	b.WriteString(cardsRow.String() + "\n\n")
 
-	// 3. Abas com suporte visual a clique
+	// 3. Abas
 	var tabsRow strings.Builder
 	for i, tab := range m.tabs {
-		count := len(m.logs[tab])
-		tabLabel := fmt.Sprintf("%d:%s (%d)", i+1, tab, count)
+		tabLabel := fmt.Sprintf("%d:%s", i+1, tab)
+		if tab != "📊 MÉTRICAS" {
+			count := len(m.logs[tab])
+			tabLabel = fmt.Sprintf("%d:%s (%d)", i+1, tab, count)
+		}
 
 		if i == m.activeTab {
 			tabsRow.WriteString(activeTabStyle.Render(tabLabel))
@@ -324,33 +425,38 @@ func (m *AppModel) View() string {
 	}
 	b.WriteString(tabsRow.String() + "\n")
 
-	// 4. Viewport de Logs
+	// 4. Viewport de Logs ou Dashboard de Métricas
 	b.WriteString(m.viewport.View() + "\n")
 
-	// 5. Rodapé interativo
-	footer := footerStyle.Render(
-		"[Tab/Clique] Alternar Abas  •  [Scroll/Setas] Rolar  •  [c] Limpar Tela  •  [q] Sair e Teardown",
-	)
-	b.WriteString(footer)
+	// 5. Rodapé Interativo com ação contextual
+	currentTab := m.tabs[m.activeTab]
+	var footerText string
+	if currentTab != "ALL" && currentTab != "📊 MÉTRICAS" {
+		footerText = fmt.Sprintf("[Tab/Clique] Abas  •  [r] REINICIAR '%s'  •  [c] Limpar Logs  •  [q] Sair", currentTab)
+	} else if currentTab == "📊 MÉTRICAS" {
+		footerText = "[Tab/Clique] Alternar Abas  •  [Scroll/Setas] Rolar Métricas  •  [q] Sair"
+	} else {
+		footerText = "[Tab/Clique] Alternar Abas  •  [1-9] Atalho Numérico  •  [Scroll/Setas] Rolar  •  [q] Sair"
+	}
+
+	b.WriteString(footerStyle.Render(footerText))
 
 	return b.String()
 }
 
-// RunTUI inicia o programa Bubble Tea conectando os eventos do EventBus ao modelo.
-func RunTUI(ctx context.Context, projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc) error {
-	model := NewAppModel(projectName, serviceNames, bus, cancel)
+// RunTUI inicia o programa Bubble Tea conectando os eventos e o callback de reinício de serviço.
+func RunTUI(ctx context.Context, projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) error {
+	model := NewAppModel(projectName, serviceNames, bus, cancel, restartFunc)
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(), // Ativa mouse, cliques e rolagem da roda
+		tea.WithMouseCellMotion(),
 	)
 
-	// Encaminha eventos do EventBus para o canal de mensagens thread-safe do Bubble Tea
 	bus.Subscribe(func(event domain.Event) {
 		p.Send(event)
 	})
 
-	// Se o contexto for cancelado externamente, encerra a TUI
 	go func() {
 		<-ctx.Done()
 		p.Quit()

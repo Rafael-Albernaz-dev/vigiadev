@@ -110,7 +110,7 @@ func TestChecker_WaitUntilHealthy_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	err := checker.WaitUntilHealthy(ctx, cfg, "127.0.0.1")
+	_, err := checker.WaitUntilHealthy(ctx, cfg, "127.0.0.1")
 	if err == nil {
 		t.Fatal("esperava erro ao esgotar tentativas")
 	}

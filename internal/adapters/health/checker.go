@@ -92,9 +92,10 @@ func (c *Checker) CheckSingle(ctx context.Context, cfg *domain.HealthCheckConfig
 }
 
 // WaitUntilHealthy repete a sondagem até obter sucesso ou esgotar retries.
-func (c *Checker) WaitUntilHealthy(ctx context.Context, cfg *domain.HealthCheckConfig, defaultHost string) error {
+// Retorna a latência da última sondagem bem-sucedida.
+func (c *Checker) WaitUntilHealthy(ctx context.Context, cfg *domain.HealthCheckConfig, defaultHost string) (time.Duration, error) {
 	if cfg == nil {
-		return nil
+		return 0, nil
 	}
 
 	retries := cfg.Retries
@@ -111,18 +112,19 @@ func (c *Checker) WaitUntilHealthy(ctx context.Context, cfg *domain.HealthCheckC
 	for attempt := 1; attempt <= retries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		default:
 		}
 
+		startProbe := time.Now()
 		err := c.CheckSingle(ctx, cfg, defaultHost)
 		if err == nil {
-			return nil
+			return time.Since(startProbe), nil
 		}
 		lastErr = err
 
 		time.Sleep(interval)
 	}
 
-	return fmt.Errorf("healthcheck esgotou %d tentativas sem sucesso: %w", retries, lastErr)
+	return 0, fmt.Errorf("healthcheck esgotou %d tentativas sem sucesso: %w", retries, lastErr)
 }
