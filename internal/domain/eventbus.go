@@ -1,13 +1,9 @@
-package application
+package domain
 
-import (
-	"sync"
-
-	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
-)
+import "sync"
 
 // EventHandler é a função de callback executada quando um evento é publicado.
-type EventHandler func(event domain.Event)
+type EventHandler func(event Event)
 
 // EventBus gerencia a publicação e subscrição de eventos concorrentes no vigiaDev.
 type EventBus struct {
@@ -15,7 +11,7 @@ type EventBus struct {
 	handlers []EventHandler
 }
 
-// NewEventBus instancia um novo barramento de eventos.
+// NewEventBus instancia um novo barramento de eventos thread-safe.
 func NewEventBus() *EventBus {
 	return &EventBus{
 		handlers: make([]EventHandler, 0),
@@ -29,8 +25,8 @@ func (eb *EventBus) Subscribe(handler EventHandler) {
 	eb.handlers = append(eb.handlers, handler)
 }
 
-// Publish dispara o evento para todos os ouvintes registrados de forma síncrona/segura.
-func (eb *EventBus) Publish(event domain.Event) {
+// Publish dispara o evento para todos os ouvintes registrados de forma thread-safe.
+func (eb *EventBus) Publish(event Event) {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
 

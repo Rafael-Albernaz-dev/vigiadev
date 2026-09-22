@@ -6,12 +6,11 @@ import (
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/process"
-	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
 func TestSupervisor_StartAndCaptureLogs(t *testing.T) {
-	bus := application.NewEventBus()
+	bus := domain.NewEventBus()
 	sup := process.NewSupervisor(bus)
 
 	var logs []domain.LogLineProduced
@@ -35,8 +34,17 @@ func TestSupervisor_StartAndCaptureLogs(t *testing.T) {
 		t.Fatalf("PID (%d) ou PGID (%d) inválidos", info.PID, info.PGID)
 	}
 
-	// Aguarda execução terminar
-	time.Sleep(100 * time.Millisecond)
+	// Aguarda as linhas de log serem emitidas e lidas
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		count := len(logs)
+		mu.Unlock()
+		if count >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -65,7 +73,7 @@ func TestSupervisor_StartAndCaptureLogs(t *testing.T) {
 }
 
 func TestSupervisor_ProcessGroupTeardown(t *testing.T) {
-	bus := application.NewEventBus()
+	bus := domain.NewEventBus()
 	sup := process.NewSupervisor(bus)
 
 	// Inicia um processo em background de longa duração

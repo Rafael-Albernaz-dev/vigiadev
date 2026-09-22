@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
@@ -28,15 +27,15 @@ type ManagedProcess struct {
 
 // Supervisor gerencia o ciclo de vida dos processos POSIX com isolamento de grupos (PGID).
 type Supervisor struct {
-	bus       *application.EventBus
+	publisher domain.EventPublisher
 	processes map[string]*ManagedProcess
 	mu        sync.Mutex
 }
 
-// NewSupervisor instancia o supervisor de processos conectado ao EventBus.
-func NewSupervisor(bus *application.EventBus) *Supervisor {
+// NewSupervisor instancia o supervisor de processos conectado ao EventPublisher.
+func NewSupervisor(publisher domain.EventPublisher) *Supervisor {
 	return &Supervisor{
-		bus:       bus,
+		publisher: publisher,
 		processes: make(map[string]*ManagedProcess),
 	}
 }
@@ -99,11 +98,22 @@ func (s *Supervisor) StartProcess(name string, command []string, env map[string]
 	s.processes[name] = proc
 
 	// 5. Goroutines concorrentes para streaming de logs
-	go s.streamPipe(name, stdoutPipe, false)
-	go s.streamPipe(name, stderrPipe, true)
+	var logWg sync.WaitGroup
+	logWg.Add(2)
+
+	go func() {
+		defer logWg.Done()
+		s.streamPipe(name, stdoutPipe, false)
+	}()
+
+	go func() {
+		defer logWg.Done()
+		s.streamPipe(name, stderrPipe, true)
+	}()
 
 	// 6. Goroutine de monitoramento de saída
 	go func() {
+		logWg.Wait() // Garante consumo integral dos buffers antes de chamar cmd.Wait()
 		waitErr := cmd.Wait()
 		s.mu.Lock()
 		proc.ExitErr = waitErr
@@ -120,22 +130,26 @@ func (s *Supervisor) StartProcess(name string, command []string, env map[string]
 			detail = waitErr.Error()
 		}
 
-		s.bus.Publish(domain.ServiceStateChanged{
-			BaseEvent: domain.NewBaseEvent(),
-			Service:   name,
-			OldState:  domain.StateStarting,
-			NewState:  newState,
-			Detail:    detail,
-		})
+		if s.publisher != nil {
+			s.publisher.Publish(domain.ServiceStateChanged{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				OldState:  domain.StateStarting,
+				NewState:  newState,
+				Detail:    detail,
+			})
+		}
 	}()
 
-	s.bus.Publish(domain.ServiceStateChanged{
-		BaseEvent: domain.NewBaseEvent(),
-		Service:   name,
-		OldState:  domain.StatePending,
-		NewState:  domain.StateStarting,
-		Detail:    fmt.Sprintf("iniciado com PID %d e PGID %d", pid, pgid),
-	})
+	if s.publisher != nil {
+		s.publisher.Publish(domain.ServiceStateChanged{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			OldState:  domain.StatePending,
+			NewState:  domain.StateStarting,
+			Detail:    fmt.Sprintf("iniciado com PID %d e PGID %d", pid, pgid),
+		})
+	}
 
 	return &domain.ServiceRuntimeInfo{
 		Name:      name,
@@ -151,12 +165,14 @@ func (s *Supervisor) streamPipe(service string, r io.Reader, isError bool) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
-		s.bus.Publish(domain.LogLineProduced{
-			BaseEvent: domain.NewBaseEvent(),
-			Service:   service,
-			Line:      line,
-			IsError:   isError,
-		})
+		if s.publisher != nil {
+			s.publisher.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   service,
+				Line:      line,
+				IsError:   isError,
+			})
+		}
 	}
 }
 

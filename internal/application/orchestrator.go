@@ -1,0 +1,205 @@
+package application
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/health"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/process"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
+)
+
+// Orchestrator coordena todo o ciclo de vida do vigiaDev: DAG, portas, processos e saúde.
+type Orchestrator struct {
+	Config     *domain.VigiaConfig
+	DAG        *DAGPlan
+	Bus        *domain.EventBus
+	Ports      *ports.PortResolver
+	Supervisor *process.Supervisor
+	Health     *health.Checker
+	WorkDir    string
+	RunID      string
+	manifest   *manifest.RunManifest
+	mu         sync.Mutex
+}
+
+// NewOrchestrator cria e valida as dependências do orquestrador.
+func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventBus) (*Orchestrator, error) {
+	dag, err := BuildDAGPlan(cfg.Services)
+	if err != nil {
+		return nil, err
+	}
+
+	if bus == nil {
+		bus = domain.NewEventBus()
+	}
+
+	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+
+	return &Orchestrator{
+		Config:     cfg,
+		DAG:        dag,
+		Bus:        bus,
+		Ports:      ports.NewPortResolver("127.0.0.1"),
+		Supervisor: process.NewSupervisor(bus),
+		Health:     health.NewChecker(),
+		WorkDir:    workDir,
+		RunID:      runID,
+		manifest: &manifest.RunManifest{
+			RunID:       runID,
+			ProjectName: cfg.ProjectName,
+			StartTime:   time.Now(),
+			Services:    make(map[string]manifest.ServiceManifest),
+		},
+	}, nil
+}
+
+// Run executa as ondas do DAG, aguarda cancelamento e faz teardown gracioso.
+func (o *Orchestrator) Run(ctx context.Context) error {
+	// 1. Garante trava exclusiva de execução
+	if err := manifest.AcquireLock(o.WorkDir); err != nil {
+		return err
+	}
+	defer func() {
+		_ = manifest.ReleaseLock(o.WorkDir)
+		_ = manifest.RemoveManifest(o.WorkDir)
+	}()
+
+	// 2. Executa onda por onda do DAG
+	for waveIdx, wave := range o.DAG.Waves {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		errChan := make(chan error, len(wave))
+		var wg sync.WaitGroup
+
+		for _, serviceName := range wave {
+			svcConfig := o.Config.Services[serviceName]
+			wg.Add(1)
+
+			go func(name string, svc domain.ServiceConfig) {
+				defer wg.Done()
+				if err := o.startService(ctx, name, svc); err != nil {
+					errChan <- err
+				}
+			}(serviceName, svcConfig)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		// Se algum serviço da onda falhou, aborta e inicia teardown
+		for err := range errChan {
+			if err != nil {
+				o.Supervisor.StopAll(2 * time.Second)
+				return fmt.Errorf("falha ao iniciar onda %d: %w", waveIdx+1, err)
+			}
+		}
+
+		// Persiste estado intermediário no manifesto
+		o.mu.Lock()
+		_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+		o.mu.Unlock()
+	}
+
+	// 3. Todos os serviços saudáveis! Aguarda sinal de encerramento
+	<-ctx.Done()
+
+	// 4. Teardown não-destrutivo estrito dos processos sob nossa custódia
+	o.Supervisor.StopAll(3 * time.Second)
+	return nil
+}
+
+// startService cuida da alocação de portas, inicialização e verificação de saúde de um serviço.
+func (o *Orchestrator) startService(ctx context.Context, name string, svc domain.ServiceConfig) error {
+	effectiveCmd := svc.Command
+	effectiveEnv := svc.Env
+	var assignedPort int
+
+	// Resolução e remapeamento de portas
+	if len(svc.Ports) > 0 {
+		origPort := svc.Ports[0]
+		assignedPort = origPort
+
+		if !o.Ports.IsPortAvailable(origPort) {
+			switch svc.PortPolicy {
+			case domain.PortPolicyRemap:
+				freePort, err := o.Ports.FindAvailablePort(origPort, 50)
+				if err != nil {
+					return err
+				}
+				assignedPort = freePort
+
+				// Interpolação declarativa
+				effectiveCmd = ports.InterpolateCommand(svc.Command, assignedPort)
+				effectiveEnv = ports.InterpolateEnv(svc.Env, assignedPort)
+
+				if svc.HealthCheck != nil {
+					if svc.HealthCheck.Port == origPort {
+						svc.HealthCheck.Port = assignedPort
+					}
+					if svc.HealthCheck.URL != "" {
+						svc.HealthCheck.URL = ports.InterpolatePort(svc.HealthCheck.URL, assignedPort)
+					}
+				}
+
+				// Notifica ouvintes
+				o.Bus.Publish(domain.PortRemapped{
+					BaseEvent:    domain.NewBaseEvent(),
+					Service:      name,
+					OriginalPort: origPort,
+					TargetPort:   assignedPort,
+				})
+
+			case domain.PortPolicyFail:
+				return &domain.PortConflictError{
+					Service: name,
+					Port:    origPort,
+					Message: "porta já em uso e política configurada para 'fail'",
+				}
+			case domain.PortPolicyReuse:
+				// Adota porta existente
+			}
+		}
+	}
+
+	// Inicia o processo no supervisor POSIX
+	info, err := o.Supervisor.StartProcess(name, effectiveCmd, effectiveEnv, o.WorkDir)
+	if err != nil {
+		return err
+	}
+
+	// Registra no manifesto de sessão
+	o.mu.Lock()
+	o.manifest.Services[name] = manifest.ServiceManifest{
+		Name: name,
+		PID:  info.PID,
+		PGID: info.PGID,
+		Port: assignedPort,
+	}
+	o.mu.Unlock()
+
+	// Healthcheck de prontidão
+	if svc.HealthCheck != nil {
+		if err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1"); err != nil {
+			return fmt.Errorf("serviço '%s' falhou no healthcheck: %w", name, err)
+		}
+	}
+
+	o.Bus.Publish(domain.ServiceStateChanged{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		OldState:  domain.StateStarting,
+		NewState:  domain.StateHealthy,
+		Detail:    "saudável e pronto",
+	})
+
+	return nil
+}

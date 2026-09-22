@@ -8,6 +8,11 @@ type Event interface {
 	OccurredAt() time.Time
 }
 
+// EventPublisher é a porta de saída para publicação de eventos.
+type EventPublisher interface {
+	Publish(event Event)
+}
+
 // BaseEvent fornece campos comuns a todos os eventos.
 type BaseEvent struct {
 	Timestamp time.Time

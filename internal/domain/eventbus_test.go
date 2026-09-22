@@ -1,15 +1,14 @@
-package application_test
+package domain_test
 
 import (
 	"sync"
 	"testing"
 
-	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
 func TestEventBus_PublishSubscribe(t *testing.T) {
-	bus := application.NewEventBus()
+	bus := domain.NewEventBus()
 
 	var received []domain.Event
 	var mu sync.Mutex

@@ -26,9 +26,12 @@ const (
 type HealthCheckConfig struct {
 	Type           HealthCheckType `yaml:"type"`
 	URL            string          `yaml:"url,omitempty"`
+	Host           string          `yaml:"host,omitempty"`
 	Port           int             `yaml:"port,omitempty"`
 	Command        []string        `yaml:"command,omitempty"`
 	ExpectedStatus int             `yaml:"expected_status,omitempty"`
+	Timeout        float64         `yaml:"timeout,omitempty"`
+	Interval       float64         `yaml:"interval,omitempty"`
 	IntervalMs     int             `yaml:"interval_ms,omitempty"`
 	TimeoutMs      int             `yaml:"timeout_ms,omitempty"`
 	Retries        int             `yaml:"retries,omitempty"`

@@ -93,6 +93,12 @@ func ValidateAndApplyDefaults(cfg *domain.VigiaConfig) error {
 
 		// Defaults de HealthCheck
 		if svc.HealthCheck != nil {
+			if svc.HealthCheck.Timeout > 0 && svc.HealthCheck.TimeoutMs <= 0 {
+				svc.HealthCheck.TimeoutMs = int(svc.HealthCheck.Timeout * 1000)
+			}
+			if svc.HealthCheck.Interval > 0 && svc.HealthCheck.IntervalMs <= 0 {
+				svc.HealthCheck.IntervalMs = int(svc.HealthCheck.Interval * 1000)
+			}
 			if svc.HealthCheck.IntervalMs <= 0 {
 				svc.HealthCheck.IntervalMs = 1000
 			}
