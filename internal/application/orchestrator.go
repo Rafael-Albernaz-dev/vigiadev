@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/process"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/telemetry"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/watcher"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
@@ -25,6 +27,7 @@ type Orchestrator struct {
 	Health     *health.Checker
 	Telemetry  *telemetry.Collector
 	Docker     *docker.DockerManager
+	Watcher    *watcher.ServiceWatcher
 	WorkDir    string
 	RunID      string
 	manifest   *manifest.RunManifest
@@ -61,7 +64,7 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		dockerMgr = dm
 	}
 
-	return &Orchestrator{
+	orch := &Orchestrator{
 		Config:     cfg,
 		DAG:        dag,
 		Bus:        bus,
@@ -78,7 +81,48 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 			StartTime:   time.Now(),
 			Services:    make(map[string]manifest.ServiceManifest),
 		},
-	}, nil
+	}
+
+	// Inicializa File Watching se algum serviço habilitou watch
+	var hasWatch bool
+	for _, svc := range cfg.Services {
+		if svc.Watch || len(svc.WatchPaths) > 0 {
+			hasWatch = true
+			break
+		}
+	}
+
+	if hasWatch {
+		w, err := watcher.NewServiceWatcher(workDir, func(serviceName string, changedPath string) {
+			relPath, err := filepath.Rel(workDir, changedPath)
+			if err != nil || relPath == "" {
+				relPath = changedPath
+			}
+
+			orch.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   serviceName,
+				Line:      fmt.Sprintf("[vigiadev] File change detected in '%s' ➔ reloading...", relPath),
+				IsError:   false,
+			})
+
+			_ = orch.RestartService(context.Background(), serviceName)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("falha ao inicializar observador de arquivos (fsnotify): %w", err)
+		}
+
+		for name, svc := range cfg.Services {
+			if svc.Watch || len(svc.WatchPaths) > 0 {
+				if err := w.WatchService(name, svc); err != nil {
+					return nil, fmt.Errorf("falha ao registrar watch no serviço '%s': %w", name, err)
+				}
+			}
+		}
+		orch.Watcher = w
+	}
+
+	return orch, nil
 }
 
 // SetDockerManager permite injetar um DockerManager customizado ou mockado para testes.
@@ -95,6 +139,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return err
 	}
 	defer func() {
+		if o.Watcher != nil {
+			_ = o.Watcher.Close()
+		}
 		_ = manifest.ReleaseLock(o.WorkDir)
 		_ = manifest.RemoveManifest(o.WorkDir)
 	}()

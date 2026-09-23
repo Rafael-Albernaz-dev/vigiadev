@@ -48,6 +48,10 @@ type ServiceConfig struct {
 	ComposeService string             `yaml:"compose_service,omitempty"`
 	ComposeFile    string             `yaml:"compose_file,omitempty"`
 	Build          *bool              `yaml:"build,omitempty"`
+	Watch          bool               `yaml:"watch,omitempty"`
+	WatchPaths     []string           `yaml:"watch_paths,omitempty"`
+	IgnorePaths    []string           `yaml:"ignore_paths,omitempty"`
+	DebounceMs     int                `yaml:"debounce_ms,omitempty"`
 }
 
 // TaskConfig representa uma tarefa one-off no DAG (ex: migrations, seeds).

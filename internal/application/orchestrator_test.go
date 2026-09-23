@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -432,6 +434,79 @@ func TestOrchestrator_DockerComposeRestart(t *testing.T) {
 	defer runner.mu.Unlock()
 	if len(runner.restartCalls) != 1 || runner.restartCalls[0] != "db" {
 		t.Errorf("esperava Restart('db'), obteve: %v", runner.restartCalls)
+	}
+}
+
+func TestOrchestrator_FileWatchReload(t *testing.T) {
+	tempDir := t.TempDir()
+
+	testFile := filepath.Join(tempDir, "app.js")
+	if err := os.WriteFile(testFile, []byte("console.log('hello')"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "watch-test",
+		Services: map[string]domain.ServiceConfig{
+			"worker": {
+				Command:    []string{"sh", "-c", "sleep 10"},
+				Watch:      true,
+				WatchPaths: []string{"app.js"},
+				DebounceMs: 50,
+				HealthCheck: &domain.HealthCheckConfig{
+					Type:       domain.HealthCheckCommand,
+					Command:    []string{"sh", "-c", "exit 0"},
+					IntervalMs: 50,
+					TimeoutMs:  200,
+					Retries:    5,
+				},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+
+	var reloadLogged bool
+	var mu sync.Mutex
+
+	bus.Subscribe(func(e domain.Event) {
+		if logEvt, ok := e.(domain.LogLineProduced); ok {
+			if logEvt.Service == "worker" && bytes.Contains([]byte(logEvt.Line), []byte("File change detected")) {
+				mu.Lock()
+				reloadLogged = true
+				mu.Unlock()
+			}
+		}
+	})
+
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatalf("failed to create orchestrator: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = orch.Run(ctx)
+	}()
+
+	// Aguarda o worker ficar saudável
+	time.Sleep(200 * time.Millisecond)
+
+	// Altera o arquivo monitorado
+	if err := os.WriteFile(testFile, []byte("console.log('world')"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Aguarda o debounce de 50ms + reload
+	time.Sleep(250 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !reloadLogged {
+		t.Errorf("esperava log de 'File change detected' para worker após alteração de arquivo")
 	}
 }
 
