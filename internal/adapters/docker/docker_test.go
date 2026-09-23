@@ -132,7 +132,7 @@ func TestDockerManager_StartAndFindContainer(t *testing.T) {
 
 	dm := docker.NewDockerManagerWithClient(bus, "/path/to/myproject", client, runner)
 
-	info, err := dm.StartComposeService(context.Background(), "redis", "", "/path/to/myproject")
+	info, err := dm.StartComposeService(context.Background(), "redis", "redis", "", "/path/to/myproject")
 	if err != nil {
 		t.Fatalf("StartComposeService falhou inesperadamente: %v", err)
 	}
@@ -387,13 +387,13 @@ func TestDockerManager_RestartAndStop(t *testing.T) {
 
 	dm := docker.NewDockerManagerWithClient(bus, "/app", client, runner)
 
-	_, err := dm.StartComposeService(context.Background(), "redis", "", "/app")
+	_, err := dm.StartComposeService(context.Background(), "redis", "redis", "", "/app")
 	if err != nil {
 		t.Fatalf("erro ao iniciar: %v", err)
 	}
 
 	// Testa Restart
-	if err := dm.RestartComposeService(context.Background(), "redis", "", "/app"); err != nil {
+	if err := dm.RestartComposeService(context.Background(), "redis", "redis", "", "/app"); err != nil {
 		t.Fatalf("Restart falhou: %v", err)
 	}
 	if len(runner.restartCalls) != 1 || runner.restartCalls[0] != "redis" {

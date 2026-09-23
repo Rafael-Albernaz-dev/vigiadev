@@ -218,7 +218,10 @@ func NewDockerManagerWithClient(bus domain.EventPublisher, workDir string, cli D
 }
 
 // StartComposeService inicia o serviço via docker compose, transmitindo logs e checando status.
-func (dm *DockerManager) StartComposeService(ctx context.Context, serviceName string, composeFile string, workDir string) (*ContainerInfo, error) {
+func (dm *DockerManager) StartComposeService(ctx context.Context, serviceName string, composeService string, composeFile string, workDir string) (*ContainerInfo, error) {
+	if composeService == "" {
+		composeService = serviceName
+	}
 	if workDir == "" {
 		workDir = dm.workDir
 	}
@@ -238,27 +241,55 @@ func (dm *DockerManager) StartComposeService(ctx context.Context, serviceName st
 		dm.bus.Publish(domain.LogLineProduced{
 			BaseEvent: domain.NewBaseEvent(),
 			Service:   serviceName,
-			Line:      fmt.Sprintf("[vigiadev] Launching docker compose service '%s'...", serviceName),
+			Line:      fmt.Sprintf("[vigiadev] Launching docker compose service '%s'...", composeService),
 			IsError:   false,
 		})
 	}
 
 	// 1. Sobe o container transmitindo output de build/pull em tempo real
-	if err := dm.runner.Up(ctx, serviceName, composeFile, workDir, logWriter); err != nil {
+	if err := dm.runner.Up(ctx, composeService, composeFile, workDir, logWriter); err != nil {
 		return nil, err
 	}
 
 	// 2. Descobre deterministicamente o ID e nome do container
-	info, err := dm.FindContainer(ctx, serviceName, workDir)
+	info, err := dm.FindContainer(ctx, composeService, workDir)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Valida se o container não morreu imediatamente no boot
+	// 3. Valida se o container não morreu imediatamente no boot ou entrou em loop de restart
 	inspect, err := dm.client.ContainerInspect(ctx, info.ID)
 	if err == nil && inspect.ContainerJSONBase != nil && inspect.State != nil {
-		if !inspect.State.Running && inspect.State.ExitCode != 0 {
-			return nil, fmt.Errorf("container exited immediately with code %d: %s", inspect.State.ExitCode, inspect.State.Error)
+		if inspect.State.Restarting || (!inspect.State.Running && inspect.State.ExitCode != 0) || (inspect.State.ExitCode != 0 && inspect.State.Pid == 0) {
+			// Lê as últimas linhas de log para o usuário ver o erro na aba do serviço
+			logReader, logErr := dm.client.ContainerLogs(ctx, info.ID, container.LogsOptions{
+				ShowStdout: true,
+				ShowStderr: true,
+				Tail:       "30",
+			})
+			if logErr == nil {
+				defer logReader.Close()
+				scanner := bufio.NewScanner(logReader)
+				for scanner.Scan() {
+					line := scanner.Text()
+					if len(line) > 8 && (line[0] == 1 || line[0] == 2) && line[1] == 0 && line[2] == 0 {
+						line = line[8:]
+					}
+					if dm.bus != nil {
+						dm.bus.Publish(domain.LogLineProduced{
+							BaseEvent: domain.NewBaseEvent(),
+							Service:   serviceName,
+							Line:      line,
+							IsError:   true,
+						})
+					}
+				}
+			}
+			errMsg := inspect.State.Error
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("exit code %d (status=%s)", inspect.State.ExitCode, inspect.State.Status)
+			}
+			return nil, fmt.Errorf("container crashed or restarting: %s", errMsg)
 		}
 	}
 
@@ -473,15 +504,21 @@ func (dm *DockerManager) StreamTelemetry(ctx context.Context, containerID string
 }
 
 // RestartComposeService reinicia exclusivamente o container do serviço focado ([r]).
-func (dm *DockerManager) RestartComposeService(ctx context.Context, serviceName string, composeFile string, workDir string) error {
+func (dm *DockerManager) RestartComposeService(ctx context.Context, serviceName string, composeService string, composeFile string, workDir string) error {
+	if composeService == "" {
+		composeService = serviceName
+	}
 	if workDir == "" {
 		workDir = dm.workDir
 	}
-	return dm.runner.Restart(ctx, serviceName, composeFile, workDir)
+	return dm.runner.Restart(ctx, composeService, composeFile, workDir)
 }
 
 // StopComposeService interrompe de forma limpa o container do serviço compose.
-func (dm *DockerManager) StopComposeService(ctx context.Context, serviceName string, composeFile string, workDir string) error {
+func (dm *DockerManager) StopComposeService(ctx context.Context, serviceName string, composeService string, composeFile string, workDir string) error {
+	if composeService == "" {
+		composeService = serviceName
+	}
 	if workDir == "" {
 		workDir = dm.workDir
 	}
@@ -494,7 +531,7 @@ func (dm *DockerManager) StopComposeService(ctx context.Context, serviceName str
 	delete(dm.containers, serviceName)
 	dm.mu.Unlock()
 
-	return dm.runner.Stop(ctx, serviceName, composeFile, workDir)
+	return dm.runner.Stop(ctx, composeService, composeFile, workDir)
 }
 
 // StopAll encerra de forma cirúrgica apenas os containers iniciados nesta sessão.

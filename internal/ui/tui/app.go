@@ -59,6 +59,13 @@ type tabZone struct {
 	endX   int
 }
 
+type serviceRowZone struct {
+	name   string
+	tabIdx int
+	startY int
+	endY   int
+}
+
 // ServiceCardState stores visual state and telemetry data for each supervised service.
 type ServiceCardState struct {
 	Name           string
@@ -76,22 +83,24 @@ type ServiceCardState struct {
 
 // AppModel is the primary Bubble Tea model for vigiaDev.
 type AppModel struct {
-	ProjectName string
-	services    []string
-	cards       map[string]*ServiceCardState
-	tabs        []string
-	activeTab   int
-	tabRowY     int
-	tabZones    []tabZone
-	logs        map[string][]string
-	viewport    viewport.Model
-	width       int
-	height      int
-	ready       bool
-	bus         *domain.EventBus
-	cancel      context.CancelFunc
-	restartFunc func(service string) error
-	statusMsg   string
+	ProjectName  string
+	services     []string
+	cards        map[string]*ServiceCardState
+	tabs         []string
+	activeTab    int
+	tabRowYStart int
+	tabRowYEnd   int
+	tabZones     []tabZone
+	serviceZones []serviceRowZone
+	logs         map[string][]string
+	viewport     viewport.Model
+	width        int
+	height       int
+	ready        bool
+	bus          *domain.EventBus
+	cancel       context.CancelFunc
+	restartFunc  func(service string) error
+	statusMsg    string
 }
 
 // NewAppModel instantiates the interactive TUI model.
@@ -186,16 +195,26 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// 2. Mouse click on tab bar
-		isClick := msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease || msg.Type == tea.MouseLeft
-		if isClick && (msg.Button == tea.MouseButtonLeft || msg.Type == tea.MouseLeft) {
-			if m.tabRowY > 0 && msg.Y == m.tabRowY {
+		// 2. Mouse click handling (tab bar or status card row)
+		isLeftClick := msg.Button == tea.MouseButtonLeft || msg.Type == tea.MouseLeft
+		if isLeftClick {
+			// A. Tab Bar click (with ±1 line tolerance)
+			if m.tabRowYStart > 0 && msg.Y >= m.tabRowYStart-1 && msg.Y <= m.tabRowYEnd+1 {
 				for _, tz := range m.tabZones {
 					if msg.X >= tz.startX && msg.X <= tz.endX {
 						m.activeTab = tz.index
 						m.syncViewport()
-						break
+						return m, nil
 					}
+				}
+			}
+
+			// B. Status card service row click (switches directly to service tab)
+			for _, sz := range m.serviceZones {
+				if msg.Y >= sz.startY && msg.Y <= sz.endY {
+					m.activeTab = sz.tabIdx
+					m.syncViewport()
+					return m, nil
 				}
 			}
 		}
@@ -204,7 +223,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		headerHeight := 8
+		// Header is: title (2) + statusBox (len(services) + 3) + tabs (2)
+		headerHeight := 4 + len(m.services) + 3
 		footerHeight := 2
 		viewportHeight := msg.Height - headerHeight - footerHeight
 		if viewportHeight < 5 {
@@ -219,7 +239,6 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = viewportHeight
 		}
-
 		m.syncViewport()
 
 	case domain.LogLineProduced:
@@ -388,9 +407,33 @@ func (m *AppModel) View() string {
 	header := titleStyle.Render(fmt.Sprintf(" vigiaDev • %s ", m.ProjectName))
 	b.WriteString(header + "\n\n")
 
-	// 2. Service Cards (Status + Port + Detail)
-	var cardsRow strings.Builder
+	// 2. Consolidated Services Status Card
+	var statusCardContent strings.Builder
+
+	// Box Header Title
+	cardTitle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(highlightColor).
+		Padding(0, 1).
+		Render(" SERVICES HEALTH & STATUS ")
+	statusCardContent.WriteString(cardTitle + "\n")
+
+	// Determine max service name width for neat column alignment
+	maxNameLen := 14
 	for _, name := range m.services {
+		if len(name) > maxNameLen {
+			maxNameLen = len(name)
+		}
+	}
+	if maxNameLen > 24 {
+		maxNameLen = 24
+	}
+
+	boxStartY := lipgloss.Height(b.String())
+	m.serviceZones = make([]serviceRowZone, 0, len(m.services))
+
+	for i, name := range m.services {
 		card := m.cards[name]
 		icon := "⚪"
 		stateColor := subtleColor
@@ -409,35 +452,65 @@ func (m *AppModel) View() string {
 			icon = "⏹️"
 		}
 
-		portInfo := ""
+		stateStr := strings.ToUpper(string(card.State))
+		stateBadge := lipgloss.NewStyle().Foreground(stateColor).Bold(true).Width(12).Render(fmt.Sprintf("%s %s", icon, stateStr))
+
+		namePadded := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FAFAFA")).Width(maxNameLen + 2).Render(truncate(card.Name, maxNameLen))
+
+		portStr := "-"
 		if card.Port > 0 {
 			if card.IsRemapped {
-				portInfo = fmt.Sprintf(" | :%d ➔ :%d [REMAP]", card.OriginalPort, card.Port)
+				portStr = fmt.Sprintf(":%d➔:%d", card.OriginalPort, card.Port)
 			} else {
-				portInfo = fmt.Sprintf(" | :%d", card.Port)
+				portStr = fmt.Sprintf(":%d", card.Port)
 			}
 		}
+		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(14).Render(portStr)
 
-		stateStr := strings.ToUpper(string(card.State))
-		detailLine := ""
+		resStr := "-"
+		if card.CPUPercent > 0 || card.MemoryBytes > 0 {
+			resStr = fmt.Sprintf("%s CPU • %s", telemetry.FormatCPU(card.CPUPercent), telemetry.FormatBytes(card.MemoryBytes))
+		}
+		resCol := lipgloss.NewStyle().Foreground(lipgloss.Color("#D0D0D0")).Width(22).Render(resStr)
+
+		detailStr := ""
 		if card.Detail != "" {
-			detailLine = "\n" + lipgloss.NewStyle().Foreground(subtleColor).Render(truncate(card.Detail, 32))
+			detailStr = card.Detail
+		}
+		detailCol := lipgloss.NewStyle().Foreground(subtleColor).Render(truncate(detailStr, 36))
+
+		row := fmt.Sprintf("%s  %s  %s  %s  %s", stateBadge, namePadded, portCol, resCol, detailCol)
+		statusCardContent.WriteString(row)
+		if i < len(m.services)-1 {
+			statusCardContent.WriteString("\n")
 		}
 
-		cardContent := fmt.Sprintf("%s %s%s\n%s%s",
-			icon,
-			lipgloss.NewStyle().Bold(true).Render(card.Name),
-			portInfo,
-			lipgloss.NewStyle().Foreground(stateColor).Bold(true).Render(stateStr),
-			detailLine,
-		)
-
-		cardsRow.WriteString(cardBorder.Render(cardContent))
+		// Track clickable row zone (tabs: 0=ALL, 1..N=services, N+1=METRICS)
+		tabIdx := i + 1
+		rowY := boxStartY + 1 + 1 + i // box border (1) + cardTitle (1) + index (i)
+		m.serviceZones = append(m.serviceZones, serviceRowZone{
+			name:   name,
+			tabIdx: tabIdx,
+			startY: rowY,
+			endY:   rowY,
+		})
 	}
-	b.WriteString(cardsRow.String() + "\n\n")
 
-	// 3. Tab Bar (with dynamic click coordinate mapping)
-	m.tabRowY = lipgloss.Height(b.String()) - 1
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accentColor).
+		Padding(0, 1).
+		MarginBottom(1)
+
+	if m.width > 20 {
+		boxStyle = boxStyle.Width(m.width - 2)
+	}
+
+	renderedBox := boxStyle.Render(statusCardContent.String())
+	b.WriteString(renderedBox + "\n")
+
+	// 3. Tab Bar (with exact click coordinate mapping)
+	tabRowStart := lipgloss.Height(b.String())
 	m.tabZones = make([]tabZone, len(m.tabs))
 	var tabsRow strings.Builder
 	curX := 0
@@ -462,11 +535,17 @@ func (m *AppModel) View() string {
 			startX: curX,
 			endX:   curX + tabW,
 		}
-		curX += tabW + 1
+		curX += tabW
 
 		tabsRow.WriteString(renderedTab)
 	}
-	b.WriteString(tabsRow.String() + "\n")
+
+	tabsContent := tabsRow.String()
+	tabsHeight := lipgloss.Height(tabsContent)
+	m.tabRowYStart = tabRowStart
+	m.tabRowYEnd = tabRowStart + tabsHeight - 1
+
+	b.WriteString(tabsContent + "\n")
 
 	// 4. Viewport (Logs or Metrics)
 	b.WriteString(m.viewport.View() + "\n")

@@ -300,7 +300,12 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 		composeFile = o.Config.ComposeFile
 	}
 
-	info, err := o.Docker.StartComposeService(ctx, svc.ComposeService, composeFile, o.WorkDir)
+	composeSvc := svc.ComposeService
+	if composeSvc == "" {
+		composeSvc = name
+	}
+
+	info, err := o.Docker.StartComposeService(ctx, name, composeSvc, composeFile, o.WorkDir)
 	if err != nil {
 		o.Bus.Publish(domain.ServiceStateChanged{
 			BaseEvent: domain.NewBaseEvent(),
@@ -397,7 +402,7 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 		if composeFile == "" && o.Config.ComposeFile != "" {
 			composeFile = o.Config.ComposeFile
 		}
-		if err := o.Docker.RestartComposeService(ctx, svc.ComposeService, composeFile, o.WorkDir); err != nil {
+		if err := o.Docker.RestartComposeService(ctx, name, svc.ComposeService, composeFile, o.WorkDir); err != nil {
 			o.Bus.Publish(domain.ServiceStateChanged{
 				BaseEvent: domain.NewBaseEvent(),
 				Service:   name,
