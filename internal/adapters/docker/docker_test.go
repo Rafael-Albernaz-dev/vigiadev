@@ -88,21 +88,24 @@ type mockComposeRunner struct {
 	mu           sync.Mutex
 }
 
-func (m *mockComposeRunner) Up(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Up(ctx context.Context, service string, composeFile string, workDir string, logWriter func(line string)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.upCalls = append(m.upCalls, service)
+	if logWriter != nil {
+		logWriter("Starting container " + service)
+	}
 	return nil
 }
 
-func (m *mockComposeRunner) Stop(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Stop(ctx context.Context, service string, composeFile string, workDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopCalls = append(m.stopCalls, service)
 	return nil
 }
 
-func (m *mockComposeRunner) Restart(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Restart(ctx context.Context, service string, composeFile string, workDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.restartCalls = append(m.restartCalls, service)
@@ -129,7 +132,7 @@ func TestDockerManager_StartAndFindContainer(t *testing.T) {
 
 	dm := docker.NewDockerManagerWithClient(bus, "/path/to/myproject", client, runner)
 
-	info, err := dm.StartComposeService(context.Background(), "redis", "/path/to/myproject")
+	info, err := dm.StartComposeService(context.Background(), "redis", "", "/path/to/myproject")
 	if err != nil {
 		t.Fatalf("StartComposeService falhou inesperadamente: %v", err)
 	}
@@ -384,13 +387,13 @@ func TestDockerManager_RestartAndStop(t *testing.T) {
 
 	dm := docker.NewDockerManagerWithClient(bus, "/app", client, runner)
 
-	_, err := dm.StartComposeService(context.Background(), "redis", "/app")
+	_, err := dm.StartComposeService(context.Background(), "redis", "", "/app")
 	if err != nil {
 		t.Fatalf("erro ao iniciar: %v", err)
 	}
 
 	// Testa Restart
-	if err := dm.RestartComposeService(context.Background(), "redis", "/app"); err != nil {
+	if err := dm.RestartComposeService(context.Background(), "redis", "", "/app"); err != nil {
 		t.Fatalf("Restart falhou: %v", err)
 	}
 	if len(runner.restartCalls) != 1 || runner.restartCalls[0] != "redis" {

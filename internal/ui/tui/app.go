@@ -14,7 +14,7 @@ import (
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
-// Cores e estilos Lip Gloss
+// Lip Gloss colors and styling
 var (
 	subtleColor    = lipgloss.AdaptiveColor{Light: "#9B9B9B", Dark: "#5C5C5C"}
 	highlightColor = lipgloss.AdaptiveColor{Light: "#874BFD", Dark: "#7D56F4"}
@@ -53,7 +53,13 @@ var (
 			Padding(0, 1)
 )
 
-// ServiceCardState armazena os metadados visuais de cada serviço no card superior e telemetria profunda.
+type tabZone struct {
+	index  int
+	startX int
+	endX   int
+}
+
+// ServiceCardState stores visual state and telemetry data for each supervised service.
 type ServiceCardState struct {
 	Name           string
 	State          domain.ServiceState
@@ -68,13 +74,15 @@ type ServiceCardState struct {
 	ResponseTime   time.Duration
 }
 
-// AppModel é o modelo principal do Bubble Tea.
+// AppModel is the primary Bubble Tea model for vigiaDev.
 type AppModel struct {
 	ProjectName string
 	services    []string
 	cards       map[string]*ServiceCardState
 	tabs        []string
 	activeTab   int
+	tabRowY     int
+	tabZones    []tabZone
 	logs        map[string][]string
 	viewport    viewport.Model
 	width       int
@@ -86,10 +94,10 @@ type AppModel struct {
 	statusMsg   string
 }
 
-// NewAppModel instancia o modelo da TUI interativa com suporte a aba de métricas e restart.
+// NewAppModel instantiates the interactive TUI model.
 func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) *AppModel {
 	tabs := append([]string{"ALL"}, serviceNames...)
-	tabs = append(tabs, "📊 MÉTRICAS")
+	tabs = append(tabs, "METRICS")
 
 	cards := make(map[string]*ServiceCardState)
 	logs := make(map[string][]string)
@@ -144,19 +152,17 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncViewport()
 
 		case "r":
-			// Reinicia o serviço focado na aba atual
 			currentTab := m.tabs[m.activeTab]
-			if currentTab != "ALL" && currentTab != "📊 MÉTRICAS" && m.restartFunc != nil {
-				m.statusMsg = fmt.Sprintf("Reiniciando serviço '%s'...", currentTab)
+			if currentTab != "ALL" && currentTab != "METRICS" && m.restartFunc != nil {
+				m.statusMsg = fmt.Sprintf("Restarting service '%s'...", currentTab)
 				go func(svc string) {
 					_ = m.restartFunc(svc)
 				}(currentTab)
 			}
 
 		case "c":
-			// Limpa logs da aba ativa
 			currentTab := m.tabs[m.activeTab]
-			if currentTab != "📊 MÉTRICAS" {
+			if currentTab != "METRICS" {
 				m.logs[currentTab] = make([]string, 0)
 				m.syncViewport()
 			}
@@ -170,23 +176,26 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		switch msg.Type {
-		case tea.MouseWheelUp:
+		// 1. Mouse Wheel scrolling
+		if msg.Button == tea.MouseButtonWheelUp || msg.Type == tea.MouseWheelUp {
 			m.viewport.LineUp(3)
-		case tea.MouseWheelDown:
+			return m, nil
+		}
+		if msg.Button == tea.MouseButtonWheelDown || msg.Type == tea.MouseWheelDown {
 			m.viewport.LineDown(3)
-		case tea.MouseLeft:
-			// Clique nas abas
-			if msg.Y >= 3 && msg.Y <= 6 {
-				xOffset := 1
-				for i, tab := range m.tabs {
-					tabWidth := len(tab) + 4
-					if msg.X >= xOffset && msg.X <= xOffset+tabWidth {
-						m.activeTab = i
+			return m, nil
+		}
+
+		// 2. Mouse click on tab bar
+		isClick := msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease || msg.Type == tea.MouseLeft
+		if isClick && (msg.Button == tea.MouseButtonLeft || msg.Type == tea.MouseLeft) {
+			if m.tabRowY > 0 && msg.Y == m.tabRowY {
+				for _, tz := range m.tabZones {
+					if msg.X >= tz.startX && msg.X <= tz.endX {
+						m.activeTab = tz.index
 						m.syncViewport()
 						break
 					}
-					xOffset += tabWidth
 				}
 			}
 		}
@@ -195,7 +204,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		headerHeight := 7
+		headerHeight := 8
 		footerHeight := 2
 		viewportHeight := msg.Height - headerHeight - footerHeight
 		if viewportHeight < 5 {
@@ -235,7 +244,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			card.State = msg.NewState
 			card.Detail = msg.Detail
 		}
-		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+		if m.tabs[m.activeTab] == "METRICS" {
 			m.syncViewport()
 		}
 
@@ -245,7 +254,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			card.Port = msg.TargetPort
 			card.IsRemapped = true
 		}
-		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+		if m.tabs[m.activeTab] == "METRICS" {
 			m.syncViewport()
 		}
 
@@ -259,7 +268,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				card.ResponseTime = msg.ResponseTime
 			}
 		}
-		if m.tabs[m.activeTab] == "📊 MÉTRICAS" {
+		if m.tabs[m.activeTab] == "METRICS" {
 			m.syncViewport()
 		}
 	}
@@ -272,7 +281,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *AppModel) syncViewport() {
 	currentTab := m.tabs[m.activeTab]
-	if currentTab == "📊 MÉTRICAS" {
+	if currentTab == "METRICS" {
 		m.viewport.SetContent(m.renderMetricsDashboard())
 		return
 	}
@@ -290,7 +299,7 @@ func (m *AppModel) renderMetricsDashboard() string {
 		Background(accentColor).
 		Padding(0, 1)
 
-	b.WriteString(headerStyle.Render(" PAINEL COMPLETO DE TELEMETRIA E RECURSOS DO SISTEMA ") + "\n\n")
+	b.WriteString(headerStyle.Render(" SYSTEM TELEMETRY & RESOURCE DASHBOARD ") + "\n\n")
 
 	metricBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -298,17 +307,18 @@ func (m *AppModel) renderMetricsDashboard() string {
 		Padding(1, 2).
 		MarginBottom(1)
 
-	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#C0C0C0")).Width(24)
-	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(accentColor).Width(24)
+	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA"))
 
 	for _, name := range m.services {
 		card := m.cards[name]
-
 		var content strings.Builder
-		content.WriteString(lipgloss.NewStyle().Bold(true).Foreground(highlightColor).Render(fmt.Sprintf("SERVIÇO: %s", strings.ToUpper(name))) + "\n")
-		content.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(strings.Repeat("─", 65)) + "\n")
 
-		// Status
+		// Service Title
+		title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(highlightColor).Padding(0, 1).Render(fmt.Sprintf(" SERVICE: %s ", card.Name))
+		content.WriteString(title + "\n\n")
+
+		// Operational Status
 		icon := "⚪"
 		switch card.State {
 		case domain.StateHealthy:
@@ -320,35 +330,39 @@ func (m *AppModel) renderMetricsDashboard() string {
 		case domain.StateStopped:
 			icon = "⏹️"
 		}
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Status Operacional:"), fmt.Sprintf("%s %s (%s)", icon, card.State, card.Detail)))
+		statusDesc := strings.ToUpper(string(card.State))
+		if card.Detail != "" {
+			statusDesc = fmt.Sprintf("%s (%s)", statusDesc, card.Detail)
+		}
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Operational State:"), fmt.Sprintf("%s %s", icon, statusDesc)))
 
-		// Porta
-		portStr := "nenhuma porta declarada"
+		// Network Port
+		portStr := "none declared"
 		if card.Port > 0 {
 			if card.IsRemapped {
-				portStr = fmt.Sprintf("%d ➔ %d [REMAPEAMENTO ATIVO]", card.OriginalPort, card.Port)
+				portStr = fmt.Sprintf("%d ➔ %d [DYNAMIC REMAP]", card.OriginalPort, card.Port)
 			} else {
-				portStr = fmt.Sprintf("%d (estável)", card.Port)
+				portStr = fmt.Sprintf("%d (listening)", card.Port)
 			}
 		}
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Porta de Rede (TCP):"), valStyle.Render(portStr)))
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Network Port (TCP):"), valStyle.Render(portStr)))
 
-		// CPU
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Uso de Processador:"), valStyle.Render(telemetry.FormatCPU(card.CPUPercent))))
+		// CPU Usage
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("CPU Usage:"), valStyle.Render(telemetry.FormatCPU(card.CPUPercent))))
 
-		// Memória RAM
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Uso de Memória RAM:"), valStyle.Render(fmt.Sprintf("%s (Resident Set Size)", telemetry.FormatBytes(card.MemoryBytes)))))
+		// RAM Usage
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Memory (RAM):"), valStyle.Render(fmt.Sprintf("%s (Resident Set / cgroup)", telemetry.FormatBytes(card.MemoryBytes)))))
 
-		// E/S de Disco
-		diskStr := fmt.Sprintf("Leitura: %s  •  Escrita: %s", telemetry.FormatBytes(card.DiskReadBytes), telemetry.FormatBytes(card.DiskWriteBytes))
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("E/S de Disco (I/O):"), valStyle.Render(diskStr)))
+		// Disk I/O
+		diskStr := fmt.Sprintf("Read: %s  •  Write: %s", telemetry.FormatBytes(card.DiskReadBytes), telemetry.FormatBytes(card.DiskWriteBytes))
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Disk I/O:"), valStyle.Render(diskStr)))
 
-		// Tempo de Resposta
-		probeStr := "medindo latência do probe..."
-		if card.Detail != "" && strings.Contains(card.Detail, "latência:") {
+		// Probe Latency / Response
+		probeStr := "awaiting probe sample..."
+		if card.Detail != "" && strings.Contains(card.Detail, "probe:") {
 			probeStr = card.Detail
 		}
-		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tempo de Resposta:"), valStyle.Render(probeStr)))
+		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Probe Response:"), valStyle.Render(probeStr)))
 
 		b.WriteString(metricBox.Render(content.String()) + "\n")
 	}
@@ -356,18 +370,25 @@ func (m *AppModel) renderMetricsDashboard() string {
 	return b.String()
 }
 
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
 func (m *AppModel) View() string {
 	if !m.ready {
-		return "\n  Iniciando vigiaDev TUI..."
+		return "\n  Initializing vigiaDev TUI..."
 	}
 
 	var b strings.Builder
 
-	// 1. Cabeçalho
-	header := titleStyle.Render(fmt.Sprintf(" vigiaDev — %s ", m.ProjectName))
+	// 1. Header
+	header := titleStyle.Render(fmt.Sprintf(" vigiaDev • %s ", m.ProjectName))
 	b.WriteString(header + "\n\n")
 
-	// 2. Cards Superiores Limpos e Elegantes (Status + Porta)
+	// 2. Service Cards (Status + Port + Detail)
 	var cardsRow strings.Builder
 	for _, name := range m.services {
 		card := m.cards[name]
@@ -397,46 +418,72 @@ func (m *AppModel) View() string {
 			}
 		}
 
-		cardContent := fmt.Sprintf("%s %s%s\n%s",
+		stateStr := strings.ToUpper(string(card.State))
+		detailLine := ""
+		if card.Detail != "" {
+			detailLine = "\n" + lipgloss.NewStyle().Foreground(subtleColor).Render(truncate(card.Detail, 32))
+		}
+
+		cardContent := fmt.Sprintf("%s %s%s\n%s%s",
 			icon,
 			lipgloss.NewStyle().Bold(true).Render(card.Name),
 			portInfo,
-			lipgloss.NewStyle().Foreground(stateColor).Render(string(card.State)),
+			lipgloss.NewStyle().Foreground(stateColor).Bold(true).Render(stateStr),
+			detailLine,
 		)
 
 		cardsRow.WriteString(cardBorder.Render(cardContent))
 	}
 	b.WriteString(cardsRow.String() + "\n\n")
 
-	// 3. Abas
+	// 3. Tab Bar (with dynamic click coordinate mapping)
+	m.tabRowY = lipgloss.Height(b.String()) - 1
+	m.tabZones = make([]tabZone, len(m.tabs))
 	var tabsRow strings.Builder
+	curX := 0
+
 	for i, tab := range m.tabs {
 		tabLabel := fmt.Sprintf("%d:%s", i+1, tab)
-		if tab != "📊 MÉTRICAS" {
+		if tab != "METRICS" {
 			count := len(m.logs[tab])
 			tabLabel = fmt.Sprintf("%d:%s (%d)", i+1, tab, count)
 		}
 
+		var renderedTab string
 		if i == m.activeTab {
-			tabsRow.WriteString(activeTabStyle.Render(tabLabel))
+			renderedTab = activeTabStyle.Render(tabLabel)
 		} else {
-			tabsRow.WriteString(inactiveTabStyle.Render(tabLabel))
+			renderedTab = inactiveTabStyle.Render(tabLabel)
 		}
+
+		tabW := lipgloss.Width(renderedTab)
+		m.tabZones[i] = tabZone{
+			index:  i,
+			startX: curX,
+			endX:   curX + tabW,
+		}
+		curX += tabW + 1
+
+		tabsRow.WriteString(renderedTab)
 	}
 	b.WriteString(tabsRow.String() + "\n")
 
-	// 4. Viewport de Logs ou Dashboard de Métricas
+	// 4. Viewport (Logs or Metrics)
 	b.WriteString(m.viewport.View() + "\n")
 
-	// 5. Rodapé Interativo com ação contextual
+	// 5. Interactive Footer
 	currentTab := m.tabs[m.activeTab]
 	var footerText string
-	if currentTab != "ALL" && currentTab != "📊 MÉTRICAS" {
-		footerText = fmt.Sprintf("[Tab/Clique] Abas  •  [r] REINICIAR '%s'  •  [c] Limpar Logs  •  [q] Sair", currentTab)
-	} else if currentTab == "📊 MÉTRICAS" {
-		footerText = "[Tab/Clique] Alternar Abas  •  [Scroll/Setas] Rolar Métricas  •  [q] Sair"
+	if currentTab != "ALL" && currentTab != "METRICS" {
+		footerText = fmt.Sprintf("[Tab/Click] Switch Tab  •  [r] RESTART '%s'  •  [c] Clear Logs  •  [q] Quit", currentTab)
+	} else if currentTab == "METRICS" {
+		footerText = "[Tab/Click] Switch Tab  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
 	} else {
-		footerText = "[Tab/Clique] Alternar Abas  •  [1-9] Atalho Numérico  •  [Scroll/Setas] Rolar  •  [q] Sair"
+		footerText = "[Tab/Click] Switch Tab  •  [1-9] Quick Jump  •  [Scroll/Arrows] Scroll Logs  •  [q] Quit"
+	}
+
+	if m.statusMsg != "" {
+		footerText = fmt.Sprintf("[vigiadev] %s  •  %s", m.statusMsg, footerText)
 	}
 
 	b.WriteString(footerStyle.Render(footerText))
@@ -444,7 +491,7 @@ func (m *AppModel) View() string {
 	return b.String()
 }
 
-// RunTUI inicia o programa Bubble Tea conectando os eventos e o callback de reinício de serviço.
+// RunTUI starts the Bubble Tea program with mouse tracking and event bus bridge.
 func RunTUI(ctx context.Context, projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) error {
 	model := NewAppModel(projectName, serviceNames, bus, cancel, restartFunc)
 	p := tea.NewProgram(

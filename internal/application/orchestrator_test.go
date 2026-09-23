@@ -249,21 +249,24 @@ type mockComposeRunner struct {
 	mu           sync.Mutex
 }
 
-func (m *mockComposeRunner) Up(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Up(ctx context.Context, service string, composeFile string, workDir string, logWriter func(line string)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.upCalls = append(m.upCalls, service)
+	if logWriter != nil {
+		logWriter("starting " + service)
+	}
 	return nil
 }
 
-func (m *mockComposeRunner) Stop(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Stop(ctx context.Context, service string, composeFile string, workDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopCalls = append(m.stopCalls, service)
 	return nil
 }
 
-func (m *mockComposeRunner) Restart(ctx context.Context, service string, workDir string) error {
+func (m *mockComposeRunner) Restart(ctx context.Context, service string, composeFile string, workDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.restartCalls = append(m.restartCalls, service)

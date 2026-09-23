@@ -15,7 +15,7 @@ var (
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Detecta a stack do repositório e gera um vigiadev.yaml contextual",
+	Short: "Detect repository stack and generate contextual vigiadev.yaml",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -24,44 +24,44 @@ var initCmd = &cobra.Command{
 
 		targetFile := filepath.Join(cwd, "vigiadev.yaml")
 		if _, err := os.Stat(targetFile); err == nil && !forceInit {
-			return fmt.Errorf("o arquivo 'vigiadev.yaml' já existe neste diretório (use --force para sobrescrever)")
+			return fmt.Errorf("configuration file 'vigiadev.yaml' already exists (use --force to overwrite)")
 		}
 
-		fmt.Println("🔍 Analisando o repositório local...")
+		fmt.Println("🔍 Analyzing local repository...")
 		d := detector.NewStackDetector(cwd)
 		result, err := d.Detect()
 		if err != nil {
-			return fmt.Errorf("falha ao analisar stack do projeto: %w", err)
+			return fmt.Errorf("failed to detect project stack: %w", err)
 		}
 
 		yamlContent, err := detector.GenerateYAML(result.Config, result.Markers)
 		if err != nil {
-			return fmt.Errorf("falha ao gerar sintaxe YAML: %w", err)
+			return fmt.Errorf("failed to generate YAML syntax: %w", err)
 		}
 
 		if err := os.WriteFile(targetFile, []byte(yamlContent), 0644); err != nil {
-			return fmt.Errorf("falha ao salvar arquivo 'vigiadev.yaml': %w", err)
+			return fmt.Errorf("failed to save 'vigiadev.yaml': %w", err)
 		}
 
-		fmt.Println("✨ Arquivo 'vigiadev.yaml' gerado com sucesso!")
+		fmt.Println("✨ 'vigiadev.yaml' generated successfully!")
 		if len(result.Markers) > 0 {
-			fmt.Printf("📦 Stacks detectadas: %s\n", fmt.Sprintf("%v", result.Markers))
+			fmt.Printf("📦 Detected stacks: %s\n", fmt.Sprintf("%v", result.Markers))
 		}
-		fmt.Printf("📊 Serviços configurados (%d):\n", len(result.Config.Services))
+		fmt.Printf("📊 Configured services (%d):\n", len(result.Config.Services))
 		for name, svc := range result.Config.Services {
 			if len(svc.Command) > 0 {
-				fmt.Printf("  • %s: comando %v | portas %v\n", name, svc.Command, svc.Ports)
+				fmt.Printf("  • %s: command %v | ports %v\n", name, svc.Command, svc.Ports)
 			} else if svc.ComposeService != "" {
-				fmt.Printf("  • %s: compose_service '%s' | portas %v\n", name, svc.ComposeService, svc.Ports)
+				fmt.Printf("  • %s: compose_service '%s' | ports %v\n", name, svc.ComposeService, svc.Ports)
 			}
 		}
 
-		fmt.Println("\n🚀 Execute 'vigiadev up' para iniciar e supervisionar o ambiente!")
+		fmt.Println("\n🚀 Run 'vigiadev up' to start and monitor the environment!")
 		return nil
 	},
 }
 
 func init() {
-	initCmd.Flags().BoolVarP(&forceInit, "force", "f", false, "Sobrescreve vigiadev.yaml caso já exista")
+	initCmd.Flags().BoolVarP(&forceInit, "force", "f", false, "Overwrite vigiadev.yaml if it already exists")
 	rootCmd.AddCommand(initCmd)
 }

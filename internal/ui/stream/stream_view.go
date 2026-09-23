@@ -61,7 +61,7 @@ func (sv *StreamView) handleEvent(event domain.Event) {
 		}
 
 	case domain.PortRemapped:
-		_, _ = fmt.Fprintf(sv.out, "%s🔄 [REMAP] %s: porta %d ocupada ➔ remapeado para %d%s\n",
+		_, _ = fmt.Fprintf(sv.out, "%s🔄 [REMAP] %s: port %d occupied ➔ remapped to %d%s\n",
 			ColorYellow, e.Service, e.OriginalPort, e.TargetPort, ColorReset)
 
 	case domain.ServiceStateChanged:

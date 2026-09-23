@@ -247,13 +247,26 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 	if svc.HealthCheck != nil {
 		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
 		if err != nil {
-			return fmt.Errorf("serviço '%s' falhou no healthcheck: %w", name, err)
+			o.Bus.Publish(domain.ServiceStateChanged{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				OldState:  domain.StateStarting,
+				NewState:  domain.StateFailed,
+				Detail:    fmt.Sprintf("healthcheck failed: %v", err),
+			})
+			o.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				Line:      fmt.Sprintf("[vigiadev] ERROR: Healthcheck failed for '%s': %v", name, err),
+				IsError:   true,
+			})
+			return fmt.Errorf("service '%s' failed healthcheck: %w", name, err)
 		}
 		probeLatency = lat
 	}
 
 	bootDuration := time.Since(spawnTime)
-	detail := fmt.Sprintf("saudável em %dms (latência: %dms)", bootDuration.Milliseconds(), probeLatency.Milliseconds())
+	detail := fmt.Sprintf("healthy in %dms (probe: %dms)", bootDuration.Milliseconds(), probeLatency.Milliseconds())
 
 	o.Bus.Publish(domain.ServiceStateChanged{
 		BaseEvent: domain.NewBaseEvent(),
@@ -269,7 +282,7 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 // startComposeService coordena a inicialização, healthcheck e registro de container compose.
 func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc domain.ServiceConfig, assignedPort int) error {
 	if o.Docker == nil {
-		return fmt.Errorf("DockerManager não inicializado para o serviço '%s'", name)
+		return fmt.Errorf("DockerManager not initialized for service '%s'", name)
 	}
 
 	spawnTime := time.Now()
@@ -279,10 +292,15 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 		Service:   name,
 		OldState:  domain.StatePending,
 		NewState:  domain.StateStarting,
-		Detail:    "iniciando container via docker compose...",
+		Detail:    "starting container via docker compose...",
 	})
 
-	info, err := o.Docker.StartComposeService(ctx, svc.ComposeService, o.WorkDir)
+	composeFile := svc.ComposeFile
+	if composeFile == "" && o.Config.ComposeFile != "" {
+		composeFile = o.Config.ComposeFile
+	}
+
+	info, err := o.Docker.StartComposeService(ctx, svc.ComposeService, composeFile, o.WorkDir)
 	if err != nil {
 		o.Bus.Publish(domain.ServiceStateChanged{
 			BaseEvent: domain.NewBaseEvent(),
@@ -291,7 +309,13 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 			NewState:  domain.StateFailed,
 			Detail:    err.Error(),
 		})
-		return fmt.Errorf("falha ao iniciar compose service '%s': %w", name, err)
+		o.Bus.Publish(domain.LogLineProduced{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			Line:      fmt.Sprintf("[vigiadev] ERROR: Failed to start compose service '%s': %v", name, err),
+			IsError:   true,
+		})
+		return fmt.Errorf("failed to start compose service '%s': %w", name, err)
 	}
 
 	// Registra no manifesto de sessão
@@ -310,13 +334,26 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 	if svc.HealthCheck != nil {
 		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
 		if err != nil {
-			return fmt.Errorf("serviço '%s' falhou no healthcheck: %w", name, err)
+			o.Bus.Publish(domain.ServiceStateChanged{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				OldState:  domain.StateStarting,
+				NewState:  domain.StateFailed,
+				Detail:    fmt.Sprintf("healthcheck failed: %v", err),
+			})
+			o.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				Line:      fmt.Sprintf("[vigiadev] ERROR: Healthcheck failed for '%s': %v", name, err),
+				IsError:   true,
+			})
+			return fmt.Errorf("service '%s' failed healthcheck: %w", name, err)
 		}
 		probeLatency = lat
 	}
 
 	bootDuration := time.Since(spawnTime)
-	detail := fmt.Sprintf("saudável em %dms (container: %s, latência: %dms)", bootDuration.Milliseconds(), info.Name, probeLatency.Milliseconds())
+	detail := fmt.Sprintf("healthy in %dms (container: %s, probe: %dms)", bootDuration.Milliseconds(), info.Name, probeLatency.Milliseconds())
 
 	o.Bus.Publish(domain.ServiceStateChanged{
 		BaseEvent: domain.NewBaseEvent(),
@@ -333,7 +370,7 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 	svc, exists := o.Config.Services[name]
 	if !exists {
-		return fmt.Errorf("serviço '%s' não encontrado", name)
+		return fmt.Errorf("service '%s' not found", name)
 	}
 
 	o.Bus.Publish(domain.ServiceStateChanged{
@@ -341,27 +378,45 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 		Service:   name,
 		OldState:  domain.StateHealthy,
 		NewState:  domain.StateStarting,
-		Detail:    "reiniciando sob demanda...",
+		Detail:    "restarting on demand...",
 	})
 
 	o.Bus.Publish(domain.LogLineProduced{
 		BaseEvent: domain.NewBaseEvent(),
 		Service:   name,
-		Line:      fmt.Sprintf("[vigiadev] Reiniciando serviço '%s'...", name),
+		Line:      fmt.Sprintf("[vigiadev] Restarting service '%s'...", name),
 		IsError:   false,
 	})
 
 	// Caso compose: reinicia o container de forma isolada
 	if svc.ComposeService != "" {
 		if o.Docker == nil {
-			return fmt.Errorf("DockerManager não configurado para reiniciar '%s'", name)
+			return fmt.Errorf("DockerManager not initialized for '%s'", name)
 		}
-		if err := o.Docker.RestartComposeService(ctx, svc.ComposeService, o.WorkDir); err != nil {
-			return fmt.Errorf("falha ao reiniciar serviço compose '%s': %w", name, err)
+		composeFile := svc.ComposeFile
+		if composeFile == "" && o.Config.ComposeFile != "" {
+			composeFile = o.Config.ComposeFile
+		}
+		if err := o.Docker.RestartComposeService(ctx, svc.ComposeService, composeFile, o.WorkDir); err != nil {
+			o.Bus.Publish(domain.ServiceStateChanged{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				OldState:  domain.StateStarting,
+				NewState:  domain.StateFailed,
+				Detail:    err.Error(),
+			})
+			return fmt.Errorf("failed to restart compose service '%s': %w", name, err)
 		}
 		if svc.HealthCheck != nil {
 			if _, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1"); err != nil {
-				return fmt.Errorf("serviço '%s' falhou no healthcheck após reinício: %w", name, err)
+				o.Bus.Publish(domain.ServiceStateChanged{
+					BaseEvent: domain.NewBaseEvent(),
+					Service:   name,
+					OldState:  domain.StateStarting,
+					NewState:  domain.StateFailed,
+					Detail:    fmt.Sprintf("healthcheck failed: %v", err),
+				})
+				return fmt.Errorf("service '%s' failed healthcheck after restart: %w", name, err)
 			}
 		}
 		o.Bus.Publish(domain.ServiceStateChanged{
@@ -369,7 +424,7 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 			Service:   name,
 			OldState:  domain.StateStarting,
 			NewState:  domain.StateHealthy,
-			Detail:    "reiniciado e saudável",
+			Detail:    "restarted and healthy",
 		})
 		return nil
 	}

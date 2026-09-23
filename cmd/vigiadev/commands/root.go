@@ -8,10 +8,10 @@ var (
 	cfgFile string
 	rootCmd = &cobra.Command{
 		Use:   "vigiadev",
-		Short: "vigiadev — Orquestrador e supervisor local determinístico para times modernos",
-		Long: `vigiadev é um orquestrador de desenvolvimento local de alto desempenho.
-Ele gerencia processos locais, Docker Compose, dependências via DAG,
-remapeamento determinístico de portas e fornece telemetria em tempo real via TUI.`,
+		Short: "vigiadev — Deterministic local development orchestrator and supervisor",
+		Long: `vigiadev is a high-performance local development orchestrator.
+It manages native host processes, Docker Compose, DAG dependencies,
+deterministic port remapping, and provides real-time telemetry via TUI.`,
 	}
 )
 
@@ -20,5 +20,5 @@ func Execute() error {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Caminho do arquivo de configuração (ex: vigia.yaml)")
+	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (e.g. vigiadev.yaml)")
 }

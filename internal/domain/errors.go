@@ -6,13 +6,13 @@ import (
 )
 
 var (
-	ErrServiceNotFound    = errors.New("serviço não encontrado na configuração")
-	ErrCircularDependency = errors.New("dependência circular detectada no grafo (DAG)")
-	ErrStaleLockDetected  = errors.New("sessão anterior parece ter caído abruptamente (lock órfão)")
-	ErrSessionLocked      = errors.New("outra instância do vigiaDev já está em execução neste diretório")
+	ErrServiceNotFound    = errors.New("service not found in configuration")
+	ErrCircularDependency = errors.New("circular dependency detected in DAG")
+	ErrStaleLockDetected  = errors.New("previous session terminated abruptly (stale lock detected)")
+	ErrSessionLocked      = errors.New("another vigiaDev instance is already running in this directory")
 )
 
-// PortConflictError descreve conflito de alocação de portas no host.
+// PortConflictError describes a host port conflict.
 type PortConflictError struct {
 	Service string
 	Port    int
@@ -20,5 +20,5 @@ type PortConflictError struct {
 }
 
 func (e *PortConflictError) Error() string {
-	return fmt.Sprintf("conflito na porta %d para o serviço '%s': %s", e.Port, e.Service, e.Message)
+	return fmt.Sprintf("conflict on port %d for service '%s': %s", e.Port, e.Service, e.Message)
 }

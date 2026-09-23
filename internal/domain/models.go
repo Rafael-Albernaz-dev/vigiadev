@@ -39,13 +39,15 @@ type HealthCheckConfig struct {
 
 // ServiceConfig representa a declaração de um serviço no vigiaDev.
 type ServiceConfig struct {
-	Command        []string          `yaml:"command,omitempty"`
-	Ports          []int             `yaml:"ports,omitempty"`
-	PortPolicy     PortPolicy        `yaml:"port_policy,omitempty"`
-	DependsOn      []string          `yaml:"depends_on,omitempty"`
-	Env            map[string]string `yaml:"env,omitempty"`
+	Command        []string           `yaml:"command,omitempty"`
+	Ports          []int              `yaml:"ports,omitempty"`
+	PortPolicy     PortPolicy         `yaml:"port_policy,omitempty"`
+	DependsOn      []string           `yaml:"depends_on,omitempty"`
+	Env            map[string]string  `yaml:"env,omitempty"`
 	HealthCheck    *HealthCheckConfig `yaml:"healthcheck,omitempty"`
-	ComposeService string            `yaml:"compose_service,omitempty"`
+	ComposeService string             `yaml:"compose_service,omitempty"`
+	ComposeFile    string             `yaml:"compose_file,omitempty"`
+	Build          *bool              `yaml:"build,omitempty"`
 }
 
 // TaskConfig representa uma tarefa one-off no DAG (ex: migrations, seeds).
@@ -59,6 +61,7 @@ type TaskConfig struct {
 type VigiaConfig struct {
 	Version     int                      `yaml:"version"`
 	ProjectName string                   `yaml:"project_name"`
+	ComposeFile string                   `yaml:"compose_file,omitempty"`
 	Services    map[string]ServiceConfig `yaml:"services,omitempty"`
 	Tasks       map[string]TaskConfig    `yaml:"tasks,omitempty"`
 }

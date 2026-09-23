@@ -12,21 +12,21 @@ import (
 
 var doctorCmd = &cobra.Command{
 	Use:   "doctor",
-	Short: "Verifica a integridade do ambiente e pré-requisitos locais",
+	Short: "Check local environment prerequisites and system health",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("🩺 vigiadev Doctor — Diagnóstico do Ambiente Local")
+		fmt.Println("🩺 vigiadev Doctor — Local Environment Diagnostics")
 		fmt.Println("--------------------------------------------------")
 
-		// 1. SO e Runtime
-		fmt.Printf("✅ SO / Arquitetura: %s / %s (%d CPUs)\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
+		// 1. OS & Runtime
+		fmt.Printf("✅ OS / Architecture: %s / %s (%d CPUs)\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
 
 		// 2. Docker daemon
 		conn, err := net.DialTimeout("unix", "/var/run/docker.sock", 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			fmt.Println("✅ Docker Engine: Ativo e receptivo via /var/run/docker.sock")
+			fmt.Println("✅ Docker Engine: Active and responsive via /var/run/docker.sock")
 		} else {
-			fmt.Println("⚠️ Docker Engine: Não foi possível conectar ao socket Unix (/var/run/docker.sock)")
+			fmt.Println("⚠️ Docker Engine: Could not connect to Unix socket (/var/run/docker.sock)")
 		}
 
 		// 3. Docker Compose v2 CLI
@@ -34,7 +34,7 @@ var doctorCmd = &cobra.Command{
 		if out, err := cmdCompose.Output(); err == nil {
 			fmt.Printf("✅ Docker Compose v2: %s", string(out))
 		} else {
-			fmt.Println("⚠️ Docker Compose: Binário 'docker compose' não respondeu")
+			fmt.Println("⚠️ Docker Compose: 'docker compose' binary did not respond")
 		}
 
 		// 4. Git
@@ -44,7 +44,7 @@ var doctorCmd = &cobra.Command{
 		}
 
 		fmt.Println("--------------------------------------------------")
-		fmt.Println("✨ Diagnóstico concluído.")
+		fmt.Println("✨ Diagnostics complete.")
 	},
 }
 
