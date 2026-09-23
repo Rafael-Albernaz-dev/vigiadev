@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -403,3 +405,29 @@ func TestDockerManager_RestartAndStop(t *testing.T) {
 		t.Errorf("esperava stop('redis'), obteve %v", runner.stopCalls)
 	}
 }
+
+func TestFindComposeFile(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Sem nenhum arquivo compose
+	if f := docker.FindComposeFile(tempDir); f != "" {
+		t.Errorf("esperava string vazia quando não há compose, obteve '%s'", f)
+	}
+
+	// 2. Com arquivo não-convencional (ex: docker-compose.viabilidade.yml)
+	customFile := filepath.Join(tempDir, "docker-compose.viabilidade.yml")
+	_ = os.WriteFile(customFile, []byte("services: {}"), 0644)
+
+	if f := docker.FindComposeFile(tempDir); f != "docker-compose.viabilidade.yml" {
+		t.Errorf("esperava 'docker-compose.viabilidade.yml', obteve '%s'", f)
+	}
+
+	// 3. Com arquivo canônico (compose.yaml deve ter precedência máxima)
+	canonicFile := filepath.Join(tempDir, "compose.yaml")
+	_ = os.WriteFile(canonicFile, []byte("services: {}"), 0644)
+
+	if f := docker.FindComposeFile(tempDir); f != "compose.yaml" {
+		t.Errorf("esperava precedência de 'compose.yaml', obteve '%s'", f)
+	}
+}
+

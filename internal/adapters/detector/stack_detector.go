@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 	"gopkg.in/yaml.v3"
 )
@@ -79,23 +80,14 @@ func (sd *StackDetector) Detect() (*DetectionResult, error) {
 	}, nil
 }
 
-// detectDockerCompose procura por compose.yaml ou docker-compose.yml.
+// detectDockerCompose procura por compose.yaml ou docker-compose.yml (inclusive com sufixos).
 func (sd *StackDetector) detectDockerCompose() (map[string]domain.ServiceConfig, string) {
-	candidates := []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
-	var foundPath string
-
-	for _, c := range candidates {
-		p := filepath.Join(sd.RootDir, c)
-		if _, err := os.Stat(p); err == nil {
-			foundPath = p
-			break
-		}
-	}
-
-	if foundPath == "" {
+	composeFile := docker.FindComposeFile(sd.RootDir)
+	if composeFile == "" {
 		return nil, ""
 	}
 
+	foundPath := filepath.Join(sd.RootDir, composeFile)
 	data, err := os.ReadFile(foundPath)
 	if err != nil {
 		return nil, ""

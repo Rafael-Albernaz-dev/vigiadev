@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -38,11 +39,48 @@ type ComposeRunner interface {
 	Restart(ctx context.Context, service string, workDir string) error
 }
 
+// FindComposeFile busca automaticamente arquivos compose canônicos ou com sufixos contextuais (ex: docker-compose.viabilidade.yml).
+func FindComposeFile(workDir string) string {
+	standard := []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+	for _, f := range standard {
+		if _, err := os.Stat(filepath.Join(workDir, f)); err == nil {
+			return f
+		}
+	}
+
+	patterns := []string{
+		"compose.*.yaml",
+		"compose.*.yml",
+		"docker-compose.*.yaml",
+		"docker-compose.*.yml",
+	}
+	for _, p := range patterns {
+		matches, err := filepath.Glob(filepath.Join(workDir, p))
+		if err == nil && len(matches) > 0 {
+			// Prioriza arquivos que não sejam de produção estrita caso haja mais de um
+			for _, m := range matches {
+				base := filepath.Base(m)
+				if !strings.Contains(base, "production") && !strings.Contains(base, "prod") {
+					return base
+				}
+			}
+			return filepath.Base(matches[0])
+		}
+	}
+	return ""
+}
+
 // DefaultComposeRunner executa comandos reais de 'docker compose'.
 type DefaultComposeRunner struct{}
 
 func (d *DefaultComposeRunner) Up(ctx context.Context, service string, workDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "compose", "up", "-d", service)
+	args := []string{"compose"}
+	if cf := FindComposeFile(workDir); cf != "" {
+		args = append(args, "-f", cf)
+	}
+	args = append(args, "up", "-d", service)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -52,7 +90,13 @@ func (d *DefaultComposeRunner) Up(ctx context.Context, service string, workDir s
 }
 
 func (d *DefaultComposeRunner) Stop(ctx context.Context, service string, workDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "compose", "stop", service)
+	args := []string{"compose"}
+	if cf := FindComposeFile(workDir); cf != "" {
+		args = append(args, "-f", cf)
+	}
+	args = append(args, "stop", service)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -62,7 +106,13 @@ func (d *DefaultComposeRunner) Stop(ctx context.Context, service string, workDir
 }
 
 func (d *DefaultComposeRunner) Restart(ctx context.Context, service string, workDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "compose", "restart", service)
+	args := []string{"compose"}
+	if cf := FindComposeFile(workDir); cf != "" {
+		args = append(args, "-f", cf)
+	}
+	args = append(args, "restart", service)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
