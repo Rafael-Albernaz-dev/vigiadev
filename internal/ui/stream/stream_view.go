@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
@@ -52,8 +53,13 @@ func (sv *StreamView) handleEvent(event domain.Event) {
 
 	switch e := event.(type) {
 	case domain.LogLineProduced:
+		timestamp := e.OccurredAt()
+		if timestamp.IsZero() {
+			timestamp = time.Now()
+		}
+		timeStr := timestamp.Format("15:04:05")
 		color := sv.getServiceColor(e.Service)
-		prefix := fmt.Sprintf("%s[%s]%s", color, e.Service, ColorReset)
+		prefix := fmt.Sprintf("%s%s%s %s[%s]%s", ColorGray, timeStr, ColorReset, color, e.Service, ColorReset)
 		if e.IsError {
 			_, _ = fmt.Fprintf(sv.out, "%s %s%s%s\n", prefix, ColorRed, e.Line, ColorReset)
 		} else {

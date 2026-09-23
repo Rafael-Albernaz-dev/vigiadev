@@ -323,6 +323,23 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		Detail:    detail,
 	})
 
+	if svc.Watch || len(svc.WatchPaths) > 0 {
+		debounceMs := svc.DebounceMs
+		if debounceMs <= 0 {
+			debounceMs = 300
+		}
+		watchDesc := "all files"
+		if len(svc.WatchPaths) > 0 {
+			watchDesc = fmt.Sprintf("%v", svc.WatchPaths)
+		}
+		o.Bus.Publish(domain.LogLineProduced{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			Line:      fmt.Sprintf("[vigiadev] File watch active: %s (debounce: %dms)", watchDesc, debounceMs),
+			IsError:   false,
+		})
+	}
+
 	return nil
 }
 
@@ -414,6 +431,23 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 		NewState:  domain.StateHealthy,
 		Detail:    detail,
 	})
+
+	if svc.Watch || len(svc.WatchPaths) > 0 {
+		debounceMs := svc.DebounceMs
+		if debounceMs <= 0 {
+			debounceMs = 300
+		}
+		watchDesc := "all files"
+		if len(svc.WatchPaths) > 0 {
+			watchDesc = fmt.Sprintf("%v", svc.WatchPaths)
+		}
+		o.Bus.Publish(domain.LogLineProduced{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			Line:      fmt.Sprintf("[vigiadev] File watch active: %s (debounce: %dms)", watchDesc, debounceMs),
+			IsError:   false,
+		})
+	}
 
 	return nil
 }

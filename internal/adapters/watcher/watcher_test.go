@@ -149,3 +149,60 @@ func TestServiceWatcher_CustomIgnorePaths(t *testing.T) {
 		t.Errorf("esperava 0 disparos para ignore_paths customizados, obteve %d", count)
 	}
 }
+
+func TestServiceWatcher_SpecificFilePath(t *testing.T) {
+	tempDir := t.TempDir()
+	serverJs := filepath.Join(tempDir, "server.js")
+	otherJs := filepath.Join(tempDir, "other.js")
+
+	_ = os.WriteFile(serverJs, []byte("console.log('init');"), 0644)
+	_ = os.WriteFile(otherJs, []byte("console.log('other');"), 0644)
+
+	var triggerCount int32
+	var lastChanged string
+	var mu sync.Mutex
+
+	sw, err := watcher.NewServiceWatcher(tempDir, func(serviceName string, changedPath string) {
+		atomic.AddInt32(&triggerCount, 1)
+		mu.Lock()
+		lastChanged = changedPath
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sw.Close()
+
+	cfg := domain.ServiceConfig{
+		WatchPaths: []string{"server.js"},
+		DebounceMs: 30,
+	}
+	if err := sw.WatchService("backend", cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Alterar other.js NÃO deve disparar
+	_ = os.WriteFile(otherJs, []byte("console.log('changed');"), 0644)
+	time.Sleep(80 * time.Millisecond)
+
+	if count := atomic.LoadInt32(&triggerCount); count != 0 {
+		t.Errorf("esperava 0 disparos para arquivo não vigiado, obteve %d", count)
+	}
+
+	// Alterar server.js DEVE disparar
+	_ = os.WriteFile(serverJs, []byte("console.log('vigiadev reload');"), 0644)
+	time.Sleep(80 * time.Millisecond)
+
+	if count := atomic.LoadInt32(&triggerCount); count != 1 {
+		t.Errorf("esperava 1 disparo ao alterar server.js, obteve %d", count)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if filepath.Base(lastChanged) != "server.js" {
+		t.Errorf("esperava arquivo alterado 'server.js', obteve '%s'", lastChanged)
+	}
+}
+

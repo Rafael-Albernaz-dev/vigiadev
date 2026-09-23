@@ -242,14 +242,25 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncViewport()
 
 	case domain.LogLineProduced:
-		line := fmt.Sprintf("[%s] %s", msg.Service, msg.Line)
+		timestamp := msg.OccurredAt()
+		if timestamp.IsZero() {
+			timestamp = time.Now()
+		}
+		timeStr := timestamp.Format("15:04:05")
+		timeStyled := lipgloss.NewStyle().Foreground(lipgloss.Color("#767676")).Render(timeStr)
+		serviceStyled := lipgloss.NewStyle().Bold(true).Foreground(accentColor).Render(fmt.Sprintf("[%s]", msg.Service))
+
+		content := msg.Line
 		if msg.IsError {
-			line = lipgloss.NewStyle().Foreground(errorColor).Render(line)
+			content = lipgloss.NewStyle().Foreground(errorColor).Render(content)
 		}
 
-		m.logs["ALL"] = append(m.logs["ALL"], line)
+		allLine := fmt.Sprintf("%s %s %s", timeStyled, serviceStyled, content)
+		svcLine := fmt.Sprintf("%s %s", timeStyled, content)
+
+		m.logs["ALL"] = append(m.logs["ALL"], allLine)
 		if _, exists := m.logs[msg.Service]; exists {
-			m.logs[msg.Service] = append(m.logs[msg.Service], line)
+			m.logs[msg.Service] = append(m.logs[msg.Service], svcLine)
 		}
 
 		currentTab := m.tabs[m.activeTab]

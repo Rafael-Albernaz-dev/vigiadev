@@ -48,8 +48,41 @@ type serviceWatchState struct {
 	debounce    time.Duration
 	timer       *time.Timer
 	lastPath    string
+	watchAll    bool
+	watchPaths  []string
 	ignorePaths []string
 	mu          sync.Mutex
+}
+
+func (s *serviceWatchState) matches(changedPath string, workDir string) bool {
+	cleanChanged := filepath.Clean(changedPath)
+
+	// Verifica se o caminho alterado está dentro de algum ignorePaths do serviço
+	rel, err := filepath.Rel(workDir, cleanChanged)
+	if err == nil {
+		for _, ignored := range s.ignorePaths {
+			cleanIgnored := filepath.Clean(ignored)
+			if rel == cleanIgnored || strings.HasPrefix(rel, cleanIgnored+string(filepath.Separator)) {
+				return false
+			}
+		}
+	}
+
+	if s.watchAll {
+		return true
+	}
+
+	for _, wp := range s.watchPaths {
+		cleanWP := filepath.Clean(wp)
+		if cleanChanged == cleanWP {
+			return true
+		}
+		// Se wp for diretório, confere se changedPath está sob ele
+		if strings.HasPrefix(cleanChanged, cleanWP+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ServiceWatcher supervisiona o sistema de arquivos e dispara hot-reload com debounce.
@@ -107,9 +140,27 @@ func (sw *ServiceWatcher) WatchService(serviceName string, cfg domain.ServiceCon
 		debounceMs = 300
 	}
 
+	targets := cfg.WatchPaths
+	watchAll := false
+	if len(targets) == 0 && cfg.Watch {
+		targets = []string{"."}
+		watchAll = true
+	}
+
+	resolvedWatchPaths := make([]string, 0, len(targets))
+	for _, target := range targets {
+		resolved := target
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(sw.workDir, target)
+		}
+		resolvedWatchPaths = append(resolvedWatchPaths, filepath.Clean(resolved))
+	}
+
 	state := &serviceWatchState{
 		name:        serviceName,
 		debounce:    time.Duration(debounceMs) * time.Millisecond,
+		watchAll:    watchAll,
+		watchPaths:  resolvedWatchPaths,
 		ignorePaths: cfg.IgnorePaths,
 	}
 
@@ -117,20 +168,14 @@ func (sw *ServiceWatcher) WatchService(serviceName string, cfg domain.ServiceCon
 	sw.services[serviceName] = state
 	sw.mu.Unlock()
 
-	targets := cfg.WatchPaths
-	if len(targets) == 0 && cfg.Watch {
-		targets = []string{"."}
-	}
-
-	for _, target := range targets {
-		resolved := target
-		if !filepath.IsAbs(resolved) {
-			resolved = filepath.Join(sw.workDir, target)
-		}
-
+	for _, resolved := range resolvedWatchPaths {
 		info, err := os.Stat(resolved)
 		if err != nil {
-			// Se o caminho não existe ainda, ignora silenciosamente ou aguarda criação
+			// Se o caminho não existe ainda, vigia o diretório pai se ele existir
+			parent := filepath.Dir(resolved)
+			if pInfo, pErr := os.Stat(parent); pErr == nil && pInfo.IsDir() {
+				sw.addDir(parent, serviceName)
+			}
 			continue
 		}
 
@@ -141,6 +186,7 @@ func (sw *ServiceWatcher) WatchService(serviceName string, cfg domain.ServiceCon
 		} else {
 			dir := filepath.Dir(resolved)
 			sw.addDir(dir, serviceName)
+			_ = sw.watcher.Add(resolved)
 		}
 	}
 
@@ -235,16 +281,19 @@ func (sw *ServiceWatcher) eventLoop() {
 				}
 			}
 
-			// Identifica quais serviços observam este diretório
+			// Identifica quais serviços observam este diretório ou arquivo
 			dir := filepath.Dir(event.Name)
 			sw.mu.RLock()
-			services := make([]string, 0)
+			services := make(map[string]bool)
 			for svc := range sw.watched[dir] {
-				services = append(services, svc)
+				services[svc] = true
+			}
+			for svc := range sw.watched[event.Name] {
+				services[svc] = true
 			}
 			sw.mu.RUnlock()
 
-			for _, svc := range services {
+			for svc := range services {
 				sw.triggerDebounced(svc, event.Name)
 			}
 		}
@@ -262,6 +311,10 @@ func (sw *ServiceWatcher) triggerDebounced(serviceName string, changedPath strin
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+
+	if !state.matches(changedPath, sw.workDir) {
+		return
+	}
 
 	state.lastPath = changedPath
 
