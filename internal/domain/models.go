@@ -89,4 +89,6 @@ type ServiceRuntimeInfo struct {
 	BootDuration time.Duration
 	CPUPercent   float64
 	MemoryBytes  uint64
+	ContainerID  string
+	IsContainer  bool
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/health"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
@@ -23,6 +24,7 @@ type Orchestrator struct {
 	Supervisor *process.Supervisor
 	Health     *health.Checker
 	Telemetry  *telemetry.Collector
+	Docker     *docker.DockerManager
 	WorkDir    string
 	RunID      string
 	manifest   *manifest.RunManifest
@@ -42,6 +44,23 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 
 	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
 
+	var dockerMgr *docker.DockerManager
+	var hasCompose bool
+	for _, svc := range cfg.Services {
+		if svc.ComposeService != "" {
+			hasCompose = true
+			break
+		}
+	}
+
+	if hasCompose {
+		dm, err := docker.NewDockerManager(bus, workDir)
+		if err != nil {
+			return nil, fmt.Errorf("falha ao inicializar integração Docker: %w", err)
+		}
+		dockerMgr = dm
+	}
+
 	return &Orchestrator{
 		Config:     cfg,
 		DAG:        dag,
@@ -50,6 +69,7 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		Supervisor: process.NewSupervisor(bus),
 		Health:     health.NewChecker(),
 		Telemetry:  telemetry.NewCollector(bus, 1*time.Second),
+		Docker:     dockerMgr,
 		WorkDir:    workDir,
 		RunID:      runID,
 		manifest: &manifest.RunManifest{
@@ -59,6 +79,13 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 			Services:    make(map[string]manifest.ServiceManifest),
 		},
 	}, nil
+}
+
+// SetDockerManager permite injetar um DockerManager customizado ou mockado para testes.
+func (o *Orchestrator) SetDockerManager(dm *docker.DockerManager) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.Docker = dm
 }
 
 // Run executa as ondas do DAG, aguarda cancelamento e faz teardown gracioso.
@@ -78,7 +105,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		defer o.mu.Unlock()
 		res := make(map[string]int, len(o.manifest.Services))
 		for name, svc := range o.manifest.Services {
-			res[name] = svc.PID
+			if !svc.IsContainer && svc.PID > 0 {
+				res[name] = svc.PID
+			}
 		}
 		return res
 	})
@@ -113,6 +142,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		for err := range errChan {
 			if err != nil {
 				o.Supervisor.StopAll(2 * time.Second)
+				if o.Docker != nil {
+					_ = o.Docker.StopAll(context.Background())
+				}
 				return fmt.Errorf("falha ao iniciar onda %d: %w", waveIdx+1, err)
 			}
 		}
@@ -128,6 +160,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	// 4. Teardown não-destrutivo estrito dos processos sob nossa custódia
 	o.Supervisor.StopAll(3 * time.Second)
+	if o.Docker != nil {
+		_ = o.Docker.StopAll(context.Background())
+	}
 	return nil
 }
 
@@ -184,6 +219,11 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		}
 	}
 
+	// Se for um serviço gerenciado via Docker Compose, delega ao DockerManager
+	if svc.ComposeService != "" {
+		return o.startComposeService(ctx, name, svc, assignedPort)
+	}
+
 	spawnTime := time.Now()
 
 	// Inicia o processo no supervisor POSIX
@@ -226,6 +266,69 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 	return nil
 }
 
+// startComposeService coordena a inicialização, healthcheck e registro de container compose.
+func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc domain.ServiceConfig, assignedPort int) error {
+	if o.Docker == nil {
+		return fmt.Errorf("DockerManager não inicializado para o serviço '%s'", name)
+	}
+
+	spawnTime := time.Now()
+
+	o.Bus.Publish(domain.ServiceStateChanged{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		OldState:  domain.StatePending,
+		NewState:  domain.StateStarting,
+		Detail:    "iniciando container via docker compose...",
+	})
+
+	info, err := o.Docker.StartComposeService(ctx, svc.ComposeService, o.WorkDir)
+	if err != nil {
+		o.Bus.Publish(domain.ServiceStateChanged{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			OldState:  domain.StateStarting,
+			NewState:  domain.StateFailed,
+			Detail:    err.Error(),
+		})
+		return fmt.Errorf("falha ao iniciar compose service '%s': %w", name, err)
+	}
+
+	// Registra no manifesto de sessão
+	o.mu.Lock()
+	o.manifest.Services[name] = manifest.ServiceManifest{
+		Name:        name,
+		Port:        assignedPort,
+		ContainerID: info.ID,
+		IsContainer: true,
+	}
+	o.manifest.Containers = append(o.manifest.Containers, info.ID)
+	o.mu.Unlock()
+
+	var probeLatency time.Duration
+	// Healthcheck de prontidão agnóstico (TCP, HTTP ou Command)
+	if svc.HealthCheck != nil {
+		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
+		if err != nil {
+			return fmt.Errorf("serviço '%s' falhou no healthcheck: %w", name, err)
+		}
+		probeLatency = lat
+	}
+
+	bootDuration := time.Since(spawnTime)
+	detail := fmt.Sprintf("saudável em %dms (container: %s, latência: %dms)", bootDuration.Milliseconds(), info.Name, probeLatency.Milliseconds())
+
+	o.Bus.Publish(domain.ServiceStateChanged{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		OldState:  domain.StateStarting,
+		NewState:  domain.StateHealthy,
+		Detail:    detail,
+	})
+
+	return nil
+}
+
 // RestartService reinicia sob demanda um único serviço sem interromper o restante do ambiente.
 func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 	svc, exists := o.Config.Services[name]
@@ -247,6 +350,29 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 		Line:      fmt.Sprintf("[vigiadev] Reiniciando serviço '%s'...", name),
 		IsError:   false,
 	})
+
+	// Caso compose: reinicia o container de forma isolada
+	if svc.ComposeService != "" {
+		if o.Docker == nil {
+			return fmt.Errorf("DockerManager não configurado para reiniciar '%s'", name)
+		}
+		if err := o.Docker.RestartComposeService(ctx, svc.ComposeService, o.WorkDir); err != nil {
+			return fmt.Errorf("falha ao reiniciar serviço compose '%s': %w", name, err)
+		}
+		if svc.HealthCheck != nil {
+			if _, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1"); err != nil {
+				return fmt.Errorf("serviço '%s' falhou no healthcheck após reinício: %w", name, err)
+			}
+		}
+		o.Bus.Publish(domain.ServiceStateChanged{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			OldState:  domain.StateStarting,
+			NewState:  domain.StateHealthy,
+			Detail:    "reiniciado e saudável",
+		})
+		return nil
+	}
 
 	// 1. Encerra o processo atual no supervisor
 	_ = o.Supervisor.StopProcess(name, 2*time.Second)

@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"syscall"
 	"time"
 
@@ -27,6 +28,24 @@ var downCmd = &cobra.Command{
 
 		fmt.Printf("⏹️ Encerrando sessão '%s' do projeto '%s'...\n", m.RunID, m.ProjectName)
 
+		// 1. Encerra containers registrados no manifesto sem destruir volumes/redes (DEC-005, DEC-018)
+		stoppedContainers := make(map[string]bool)
+		for _, cID := range m.Containers {
+			if !stoppedContainers[cID] {
+				fmt.Printf("  • Parando container '%s'...\n", cID)
+				_ = exec.Command("docker", "stop", cID).Run()
+				stoppedContainers[cID] = true
+			}
+		}
+		for name, svc := range m.Services {
+			if svc.IsContainer && svc.ContainerID != "" && !stoppedContainers[svc.ContainerID] {
+				fmt.Printf("  • Parando container do serviço '%s' (%s)...\n", name, svc.ContainerID)
+				_ = exec.Command("docker", "stop", svc.ContainerID).Run()
+				stoppedContainers[svc.ContainerID] = true
+			}
+		}
+
+		// 2. Encerra processos POSIX da sessão
 		for name, svc := range m.Services {
 			if svc.PGID > 0 {
 				fmt.Printf("  • Parando serviço '%s' (PGID %d)...\n", name, svc.PGID)

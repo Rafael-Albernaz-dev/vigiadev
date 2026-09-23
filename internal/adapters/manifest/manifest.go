@@ -21,10 +21,12 @@ const (
 
 // ServiceManifest armazena metadados de processo para rastreamento estrito de posse.
 type ServiceManifest struct {
-	Name string `json:"name"`
-	PID  int    `json:"pid"`
-	PGID int    `json:"pgid"`
-	Port int    `json:"port,omitempty"`
+	Name        string `json:"name"`
+	PID         int    `json:"pid,omitempty"`
+	PGID        int    `json:"pgid,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	ContainerID string `json:"container_id,omitempty"`
+	IsContainer bool   `json:"is_container,omitempty"`
 }
 
 // RunManifest representa o estado persistido da sessão ativa no disco (.vigiadev/run.json).
