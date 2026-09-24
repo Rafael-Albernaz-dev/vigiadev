@@ -3,6 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"net"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -67,6 +70,69 @@ type serviceRowZone struct {
 	endY   int
 }
 
+type probeStatus struct {
+	Type    domain.HealthCheckType
+	Target  string
+	Latency time.Duration
+	Success bool
+	Error   string
+}
+
+type SystemDoctorInfo struct {
+	OS        string
+	Docker    string
+	DockerOK  bool
+	Compose   string
+	ComposeOK bool
+	Git       string
+	GitOK     bool
+}
+
+func checkSystemPrereqs() SystemDoctorInfo {
+	info := SystemDoctorInfo{
+		OS: fmt.Sprintf("%s / %s (%d CPUs)", runtime.GOOS, runtime.GOARCH, runtime.NumCPU()),
+	}
+
+	// 1. Docker Engine
+	conn, err := net.DialTimeout("unix", "/var/run/docker.sock", 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		info.Docker = "Active (/var/run/docker.sock)"
+		info.DockerOK = true
+	} else {
+		info.Docker = "Unavailable"
+		info.DockerOK = false
+	}
+
+	// 2. Docker Compose
+	cmdCompose := exec.Command("docker", "compose", "version", "--short")
+	if out, err := cmdCompose.Output(); err == nil && len(out) > 0 {
+		info.Compose = strings.TrimSpace(string(out))
+		info.ComposeOK = true
+	} else {
+		cmdCompose = exec.Command("docker", "compose", "version")
+		if out, err := cmdCompose.Output(); err == nil {
+			info.Compose = strings.TrimSpace(string(out))
+			info.ComposeOK = true
+		} else {
+			info.Compose = "Not responsive"
+			info.ComposeOK = false
+		}
+	}
+
+	// 3. Git
+	cmdGit := exec.Command("git", "version")
+	if out, err := cmdGit.Output(); err == nil {
+		info.Git = strings.TrimSpace(strings.TrimPrefix(string(out), "git version "))
+		info.GitOK = true
+	} else {
+		info.Git = "Not found"
+		info.GitOK = false
+	}
+
+	return info
+}
+
 // ServiceCardState stores visual state and telemetry data for each supervised service.
 type ServiceCardState struct {
 	Name           string
@@ -84,26 +150,29 @@ type ServiceCardState struct {
 
 // AppModel is the primary Bubble Tea model for vigiaDev.
 type AppModel struct {
-	ProjectName  string
-	services     []string
-	cards        map[string]*ServiceCardState
-	tabs         []string
-	activeTab    int
-	tabRowYStart int
-	tabRowYEnd   int
-	tabZones     []tabZone
-	serviceZones []serviceRowZone
-	logs         map[string][]string
-	viewport     viewport.Model
-	width        int
-	height       int
-	ready        bool
-	bus          *domain.EventBus
-	cancel       context.CancelFunc
-	restartFunc  func(service string) error
-	statusMsg    string
-	isFiltering  bool
-	filterQuery  string
+	ProjectName     string
+	services        []string
+	cards           map[string]*ServiceCardState
+	tabs            []string
+	activeTab       int
+	tabRowYStart    int
+	tabRowYEnd      int
+	tabZones        []tabZone
+	serviceZones    []serviceRowZone
+	logs            map[string][]string
+	viewport        viewport.Model
+	width           int
+	height          int
+	ready           bool
+	bus             *domain.EventBus
+	cancel          context.CancelFunc
+	restartFunc     func(service string) error
+	statusMsg       string
+	isFiltering     bool
+	filterQuery     string
+	diagnosticsOpen bool
+	doctorInfo      SystemDoctorInfo
+	probes          map[string]probeStatus
 }
 
 // NewAppModel instantiates the interactive TUI model.
@@ -130,6 +199,7 @@ func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus
 		tabs:        tabs,
 		activeTab:   0,
 		logs:        logs,
+		probes:      make(map[string]probeStatus),
 		bus:         bus,
 		cancel:      cancel,
 		restartFunc: restartFunc,
@@ -148,6 +218,13 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.diagnosticsOpen {
+			switch msg.String() {
+			case "d", "esc":
+				m.diagnosticsOpen = false
+			}
+			return m, nil
+		}
 		if m.isFiltering {
 			switch msg.String() {
 			case "esc":
@@ -186,6 +263,10 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "d":
+			m.diagnosticsOpen = true
+			m.doctorInfo = checkSystemPrereqs()
+			return m, nil
 
 		case "/":
 			currentTab := m.tabs[m.activeTab]
@@ -350,6 +431,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.tabs[m.activeTab] == "METRICS" {
 			m.syncViewport()
 		}
+	case domain.HealthCheckProbed:
+		m.probes[msg.Service] = probeStatus{Type: msg.Type, Target: msg.Target, Latency: msg.Latency, Success: msg.Success, Error: msg.Error}
 	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -467,6 +550,9 @@ func truncate(s string, maxLen int) string {
 }
 
 func (m *AppModel) View() string {
+	if m.diagnosticsOpen {
+		return m.renderDiagnostics()
+	}
 	if !m.ready {
 		return "\n  Initializing vigiaDev TUI..."
 	}
@@ -668,6 +754,166 @@ func (m *AppModel) View() string {
 	b.WriteString(footerStyle.Render(footerText))
 
 	return b.String()
+}
+
+func (m *AppModel) renderDiagnostics() string {
+	modalWidth := m.width - 6
+	if modalWidth > 96 {
+		modalWidth = 96
+	}
+	if modalWidth < 68 {
+		modalWidth = 68
+	}
+
+	var b strings.Builder
+
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FAFAFA")).
+		Background(highlightColor).
+		Padding(0, 1)
+
+	sectionTitleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(accentColor)
+
+	subtleTextStyle := lipgloss.NewStyle().
+		Foreground(subtleColor)
+
+	// Modal Header
+	b.WriteString(headerStyle.Render("🩺 ENVIRONMENT & HEALTH DIAGNOSTICS (Doctor)"))
+	b.WriteString("\n\n")
+
+	// Section 1: SYSTEM PREREQUISITES
+	b.WriteString(sectionTitleStyle.Render("SYSTEM & ENVIRONMENT PREREQUISITES"))
+	b.WriteByte('\n')
+
+	dockerIcon := "✅"
+	if !m.doctorInfo.DockerOK {
+		dockerIcon = "⚠️"
+	}
+	composeIcon := "✅"
+	if !m.doctorInfo.ComposeOK {
+		composeIcon = "⚠️"
+	}
+	gitIcon := "✅"
+	if !m.doctorInfo.GitOK {
+		gitIcon = "⚠️"
+	}
+
+	osDisplay := truncate(m.doctorInfo.OS, 28)
+	dockerDisplay := truncate(dockerIcon+" "+m.doctorInfo.Docker, 34)
+	gitDisplay := truncate(gitIcon+" "+m.doctorInfo.Git, 28)
+	composeDisplay := truncate(composeIcon+" "+m.doctorInfo.Compose, 34)
+
+	fmt.Fprintf(&b, "  • OS / Arch:   %-28s  Docker Engine:  %s\n", osDisplay, dockerDisplay)
+	fmt.Fprintf(&b, "  • Git Version: %-28s  Docker Compose: %s\n\n", gitDisplay, composeDisplay)
+
+	// Section 2: SERVICES HEALTHCHECKS & READINESS PROBES
+	b.WriteString(sectionTitleStyle.Render("READINESS PROBES & SERVICE HEALTH"))
+	b.WriteByte('\n')
+
+	colHeader := fmt.Sprintf("  %-9s %-16s %-6s %-18s %-9s %s", "STATUS", "SERVICE", "TYPE", "TARGET", "LATENCY", "DETAILS")
+	b.WriteString(subtleTextStyle.Render(colHeader))
+	b.WriteByte('\n')
+	separatorLen := modalWidth - 8
+	if separatorLen < 20 {
+		separatorLen = 20
+	}
+	b.WriteString(subtleTextStyle.Render("  " + strings.Repeat("─", separatorLen)))
+	b.WriteByte('\n')
+
+	for _, name := range m.services {
+		p, hasProbe := m.probes[name]
+		card := m.cards[name]
+
+		statusText := "⏳ Pending"
+		probeType := "TCP"
+		target := "-"
+		latencyStr := "-"
+		detail := "Waiting for probe..."
+
+		if card != nil && card.Port > 0 {
+			target = fmt.Sprintf("127.0.0.1:%d", card.Port)
+			if card.IsRemapped {
+				target = fmt.Sprintf(":%d [REMAP]", card.Port)
+			}
+		}
+
+		if hasProbe {
+			if p.Type != "" {
+				probeType = strings.ToUpper(string(p.Type))
+			}
+			if p.Target != "" {
+				target = p.Target
+			}
+			if p.Success {
+				statusText = "✅ Ready"
+				latencyStr = fmt.Sprintf("%dms", p.Latency.Milliseconds())
+				if latencyStr == "0ms" && p.Latency > 0 {
+					latencyStr = fmt.Sprintf("%.1fms", float64(p.Latency.Microseconds())/1000.0)
+				}
+				detail = "Healthy & responsive"
+			} else {
+				statusText = "❌ Failed"
+				if p.Latency > 0 {
+					latencyStr = fmt.Sprintf("%dms", p.Latency.Milliseconds())
+				}
+				if p.Error != "" {
+					detail = p.Error
+				} else {
+					detail = "Connection failed"
+				}
+			}
+		} else if card != nil {
+			if card.State == domain.StateHealthy {
+				statusText = "✅ Ready"
+				detail = "Active (healthy)"
+			} else if card.State == domain.StateStarting {
+				statusText = "⏳ Starting"
+				detail = "Service starting..."
+			} else if card.State == domain.StateFailed {
+				statusText = "❌ Failed"
+				if card.Detail != "" {
+					detail = card.Detail
+				} else {
+					detail = "Process crashed / exited"
+				}
+			} else if card.Detail != "" {
+				detail = card.Detail
+			}
+		}
+
+		maxDetailWidth := modalWidth - 66
+		if maxDetailWidth < 12 {
+			maxDetailWidth = 12
+		}
+
+		targetFormatted := truncate(target, 18)
+		detailFormatted := truncate(detail, maxDetailWidth)
+
+		fmt.Fprintf(&b, "  %-9s %-16s %-6s %-18s %-9s %s\n",
+			statusText,
+			truncate(name, 16),
+			probeType,
+			targetFormatted,
+			latencyStr,
+			detailFormatted,
+		)
+	}
+
+	b.WriteString("\n")
+	footerHint := subtleTextStyle.Render("Press [d] or [Esc] to dismiss  •  Press [r] to restart focused service")
+	b.WriteString(footerHint)
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(highlightColor).
+		Padding(1, 2).
+		Width(modalWidth).
+		Render(b.String())
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 }
 
 // RunTUI starts the Bubble Tea program with mouse tracking and event bus bridge.

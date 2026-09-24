@@ -66,6 +66,19 @@ type TelemetryUpdated struct {
 
 func (e TelemetryUpdated) EventName() string { return "telemetry.updated" }
 
+// HealthCheckProbed describes one readiness probe attempt for the TUI and diagnostics.
+type HealthCheckProbed struct {
+	BaseEvent
+	Service string
+	Type    HealthCheckType
+	Target  string
+	Latency time.Duration
+	Success bool
+	Error   string
+}
+
+func (e HealthCheckProbed) EventName() string { return "healthcheck.probed" }
+
 // Helper para criar eventos com timestamp atual
 func NewBaseEvent() BaseEvent {
 	return BaseEvent{Timestamp: time.Now()}

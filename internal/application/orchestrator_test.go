@@ -55,6 +55,7 @@ func TestOrchestrator_LifecycleAndManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("falha ao criar orquestrador: %v", err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -92,6 +93,82 @@ func TestOrchestrator_LifecycleAndManifest(t *testing.T) {
 	// Manifesto deve ter sido removido
 	if _, err := manifest.ReadManifest(tempDir); err == nil {
 		t.Fatal("manifesto deveria ter sido limpo no teardown")
+	}
+}
+
+func TestOrchestrator_HealthDiagnostics(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &domain.VigiaConfig{ProjectName: "probe-test", Services: map[string]domain.ServiceConfig{
+		"api": {Command: []string{"sh", "-c", "echo persisted-log; sleep 2"}, HealthCheck: &domain.HealthCheckConfig{Type: domain.HealthCheckCommand, Command: []string{"sh", "-c", "exit 0"}, Retries: 1, TimeoutMs: 500}},
+	}}
+	bus := domain.NewEventBus()
+	probes := make(chan domain.HealthCheckProbed, 2)
+	bus.Subscribe(func(event domain.Event) {
+		if probe, ok := event.(domain.HealthCheckProbed); ok {
+			probes <- probe
+		}
+	})
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(orch.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- orch.Run(ctx) }()
+	select {
+	case probe := <-probes:
+		if !probe.Success || probe.Service != "api" || probe.Type != domain.HealthCheckCommand {
+			t.Fatalf("unexpected probe diagnostic: %+v", probe)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthcheck probe event not published")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(filepath.Join(tempDir, ".vigiadev", "logs", "api.log")); err == nil && bytes.Contains(data, []byte("persisted-log")) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	data, err := os.ReadFile(filepath.Join(tempDir, ".vigiadev", "logs", "api.log"))
+	if err != nil || !bytes.Contains(data, []byte("persisted-log")) {
+		t.Fatalf("service log was not persisted: %v %q", err, data)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("orchestrator did not stop")
+	}
+}
+
+func TestOrchestrator_HealthDiagnosticsFailure(t *testing.T) {
+	cfg := &domain.VigiaConfig{ProjectName: "probe-failure", Services: map[string]domain.ServiceConfig{
+		"broken": {Command: []string{"sh", "-c", "sleep 5"}, HealthCheck: &domain.HealthCheckConfig{Type: domain.HealthCheckCommand, Command: []string{"sh", "-c", "exit 9"}, Retries: 1, TimeoutMs: 500}},
+	}}
+	bus := domain.NewEventBus()
+	probes := make(chan domain.HealthCheckProbed, 1)
+	bus.Subscribe(func(event domain.Event) {
+		if probe, ok := event.(domain.HealthCheckProbed); ok {
+			probes <- probe
+		}
+	})
+	orch, err := application.NewOrchestrator(cfg, t.TempDir(), bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(orch.Close)
+	if err := orch.Run(context.Background()); err == nil {
+		t.Fatal("expected readiness failure")
+	}
+	select {
+	case probe := <-probes:
+		if probe.Success || probe.Service != "broken" || !bytes.Contains([]byte(probe.Error), []byte("exit status 9")) {
+			t.Fatalf("failure diagnostic lost the probe error: %+v", probe)
+		}
+	default:
+		t.Fatal("failed readiness probe event not published")
 	}
 }
 
@@ -135,6 +212,7 @@ func TestOrchestrator_PortRemap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -186,6 +264,7 @@ func TestOrchestrator_RestartService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -311,6 +390,7 @@ func TestOrchestrator_DockerComposeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("falha ao criar orquestrador: %v", err)
 	}
+	t.Cleanup(orch.Close)
 
 	runner := &mockComposeRunner{}
 	client := &mockDockerClient{
@@ -401,6 +481,7 @@ func TestOrchestrator_DockerComposeRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(orch.Close)
 
 	runner := &mockComposeRunner{}
 	client := &mockDockerClient{
@@ -484,6 +565,7 @@ func TestOrchestrator_FileWatchReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create orchestrator: %v", err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -539,6 +621,7 @@ func TestOrchestrator_CompulsoryTCPProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create orchestrator: %v", err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -579,6 +662,7 @@ func TestOrchestrator_RunTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create orchestrator: %v", err)
 	}
+	t.Cleanup(orch.Close)
 
 	ctx := context.Background()
 
@@ -603,5 +687,3 @@ func TestOrchestrator_RunTask(t *testing.T) {
 		t.Error("esperava erro para task inexistente")
 	}
 }
-
-

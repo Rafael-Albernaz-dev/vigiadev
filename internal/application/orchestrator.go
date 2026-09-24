@@ -35,6 +35,8 @@ type Orchestrator struct {
 	RunID      string
 	manifest   *manifest.RunManifest
 	mu         sync.Mutex
+	closeLogs  func()
+	closeOnce  sync.Once
 }
 
 // NewOrchestrator cria e valida as dependências do orquestrador.
@@ -67,6 +69,91 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		dockerMgr = dm
 	}
 
+	// Log events are queued without waiting for filesystem I/O on producer goroutines.
+	var logMu sync.Mutex
+	var logQueue []domain.LogLineProduced
+	logsClosed := false
+	logWake := make(chan struct{}, 1)
+	stopLog := make(chan struct{})
+	logDone := make(chan struct{})
+	bus.Subscribe(func(event domain.Event) {
+		if line, ok := event.(domain.LogLineProduced); ok {
+			logMu.Lock()
+			if logsClosed {
+				logMu.Unlock()
+				return
+			}
+			logQueue = append(logQueue, line)
+			logMu.Unlock()
+			select {
+			case logWake <- struct{}{}:
+			default:
+			}
+		}
+	})
+	go func() {
+		defer close(logDone)
+		writePending := func() bool {
+			logMu.Lock()
+			if len(logQueue) == 0 {
+				logMu.Unlock()
+				return false
+			}
+			line := logQueue[0]
+			logQueue[0] = domain.LogLineProduced{}
+			logQueue = logQueue[1:]
+			logMu.Unlock()
+			if _, err := os.Stat(workDir); err != nil {
+				return true
+			}
+			timestamp := line.OccurredAt()
+			if timestamp.IsZero() {
+				timestamp = time.Now()
+			}
+			if err := os.MkdirAll(filepath.Join(workDir, ".vigiadev", "logs"), 0755); err != nil {
+				return true
+			}
+			record := fmt.Sprintf("%s\t%s\t%s\t%s\n", timestamp.Format(time.RFC3339Nano), line.Service, map[bool]string{true: "stderr", false: "stdout"}[line.IsError], line.Line)
+			for _, name := range []string{"all.log", line.Service + ".log"} {
+				f, err := os.OpenFile(filepath.Join(workDir, ".vigiadev", "logs", name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+				if err == nil {
+					_, _ = f.WriteString(record)
+					_ = f.Close()
+				}
+			}
+			return true
+		}
+		for {
+			select {
+			case <-logWake:
+			case <-stopLog:
+				for writePending() {
+				}
+				return
+			}
+			for {
+				if !writePending() {
+					break
+				}
+			}
+		}
+	}()
+	closeLogs := func() {
+		logMu.Lock()
+		if !logsClosed {
+			logsClosed = true
+			close(stopLog)
+		}
+		logMu.Unlock()
+		<-logDone
+	}
+	constructionComplete := false
+	defer func() {
+		if !constructionComplete {
+			closeLogs()
+		}
+	}()
+
 	orch := &Orchestrator{
 		Config:     cfg,
 		DAG:        dag,
@@ -78,6 +165,7 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		Docker:     dockerMgr,
 		WorkDir:    workDir,
 		RunID:      runID,
+		closeLogs:  closeLogs,
 		manifest: &manifest.RunManifest{
 			RunID:       runID,
 			ProjectName: cfg.ProjectName,
@@ -125,7 +213,53 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		orch.Watcher = w
 	}
 
+	constructionComplete = true
 	return orch, nil
+}
+
+func (o *Orchestrator) waitUntilHealthy(ctx context.Context, service string, cfg *domain.HealthCheckConfig) (time.Duration, error) {
+	retries := cfg.Retries
+	if retries <= 0 {
+		retries = 30
+	}
+	interval := time.Duration(cfg.IntervalMs) * time.Millisecond
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	target := cfg.URL
+	if target == "" && cfg.Port > 0 {
+		host := cfg.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		target = net.JoinHostPort(host, fmt.Sprint(cfg.Port))
+	}
+	if target == "" {
+		target = fmt.Sprint(cfg.Command)
+	}
+	var lastErr error
+	for attempt := 0; attempt < retries; attempt++ {
+		start := time.Now()
+		err := o.Health.CheckSingle(ctx, cfg, "127.0.0.1")
+		latency := time.Since(start)
+		probe := domain.HealthCheckProbed{BaseEvent: domain.NewBaseEvent(), Service: service, Type: cfg.Type, Target: target, Latency: latency, Success: err == nil}
+		if err != nil {
+			probe.Error = err.Error()
+		}
+		o.Bus.Publish(probe)
+		if err == nil {
+			return latency, nil
+		}
+		lastErr = err
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return latency, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return 0, fmt.Errorf("healthcheck esgotou %d tentativas sem sucesso: %w", retries, lastErr)
 }
 
 // SetDockerManager permite injetar um DockerManager customizado ou mockado para testes.
@@ -135,16 +269,26 @@ func (o *Orchestrator) SetDockerManager(dm *docker.DockerManager) {
 	o.Docker = dm
 }
 
+// Close stops owned background resources and waits for pending log writes.
+func (o *Orchestrator) Close() {
+	o.closeOnce.Do(func() {
+		if o.Watcher != nil {
+			_ = o.Watcher.Close()
+		}
+		if o.closeLogs != nil {
+			o.closeLogs()
+		}
+	})
+}
+
 // Run executa as ondas do DAG, aguarda cancelamento e faz teardown gracioso.
 func (o *Orchestrator) Run(ctx context.Context) error {
+	defer o.Close()
 	// 1. Garante trava exclusiva de execução
 	if err := manifest.AcquireLock(o.WorkDir); err != nil {
 		return err
 	}
 	defer func() {
-		if o.Watcher != nil {
-			_ = o.Watcher.Close()
-		}
 		_ = manifest.ReleaseLock(o.WorkDir)
 		_ = manifest.RemoveManifest(o.WorkDir)
 	}()
@@ -306,7 +450,7 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 	var probeLatency time.Duration
 	// Healthcheck de prontidão
 	if svc.HealthCheck != nil {
-		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
+		lat, err := o.waitUntilHealthy(ctx, name, svc.HealthCheck)
 		if err != nil {
 			o.Bus.Publish(domain.ServiceStateChanged{
 				BaseEvent: domain.NewBaseEvent(),
@@ -415,7 +559,7 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 	var probeLatency time.Duration
 	// Healthcheck de prontidão agnóstico (TCP, HTTP ou Command)
 	if svc.HealthCheck != nil {
-		lat, err := o.Health.WaitUntilHealthy(ctx, svc.HealthCheck, "127.0.0.1")
+		lat, err := o.waitUntilHealthy(ctx, name, svc.HealthCheck)
 		if err != nil {
 			o.Bus.Publish(domain.ServiceStateChanged{
 				BaseEvent: domain.NewBaseEvent(),
