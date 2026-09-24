@@ -74,6 +74,12 @@ func (sd *StackDetector) Detect() (*DetectionResult, error) {
 		cfg.Services[svcName] = pythonSvc
 	}
 
+	tasks, err := sd.DetectTasks()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Tasks = tasks
+
 	return &DetectionResult{
 		Config:  cfg,
 		Markers: markers,
@@ -157,15 +163,7 @@ func (sd *StackDetector) detectNodeJS() (domain.ServiceConfig, string) {
 	_ = json.Unmarshal(data, &pkg)
 
 	// Detecta gerenciador de pacotes por lockfile
-	pkgManager := "npm"
-	switch {
-	case fileExists(filepath.Join(sd.RootDir, "pnpm-lock.yaml")):
-		pkgManager = "pnpm"
-	case fileExists(filepath.Join(sd.RootDir, "yarn.lock")):
-		pkgManager = "yarn"
-	case fileExists(filepath.Join(sd.RootDir, "bun.lockb")) || fileExists(filepath.Join(sd.RootDir, "bun.lock")):
-		pkgManager = "bun"
-	}
+	pkgManager := sd.packageManager()
 
 	// Identifica script de inicialização
 	script := "dev"
@@ -264,4 +262,75 @@ func GenerateYAML(cfg *domain.VigiaConfig, markers []string) (string, error) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// packageManager uses a fixed precedence when multiple lockfiles are present.
+func (sd *StackDetector) packageManager() string {
+	for _, candidate := range []struct{ file, manager string }{
+		{"pnpm-lock.yaml", "pnpm"}, {"yarn.lock", "yarn"},
+		{"bun.lockb", "bun"}, {"bun.lock", "bun"}, {"package-lock.json", "npm"},
+	} {
+		if fileExists(filepath.Join(sd.RootDir, candidate.file)) {
+			return candidate.manager
+		}
+	}
+	return "npm"
+}
+
+// DetectTasks reads repository metadata only; it never executes discovered commands.
+// Explicit Node scripts win generic name collisions, followed by Go and Python.
+// Other suites remain accessible as test:go / test:python on a collision.
+// Dependencies cannot be inferred reliably from stack markers and remain explicit.
+func (sd *StackDetector) DetectTasks() (map[string]domain.TaskConfig, error) {
+	tasks := make(map[string]domain.TaskConfig)
+	data, err := os.ReadFile(filepath.Join(sd.RootDir, "package.json"))
+	if err == nil {
+		var pkg struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if err := json.Unmarshal(data, &pkg); err != nil {
+			return nil, fmt.Errorf("parse package.json: %w", err)
+		}
+		for name, script := range pkg.Scripts {
+			if strings.TrimSpace(name) != "" && strings.TrimSpace(script) != "" {
+				tasks[name] = domain.TaskConfig{Command: []string{sd.packageManager(), "run", name}}
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	addSuite := func(stack string, command []string) {
+		name := "test"
+		if _, exists := tasks[name]; exists {
+			name = "test:" + stack
+			for {
+				if _, exists := tasks[name]; !exists {
+					break
+				}
+				name += ":" + stack
+			}
+		}
+		tasks[name] = domain.TaskConfig{Command: command}
+	}
+	if fileExists(filepath.Join(sd.RootDir, "go.mod")) {
+		addSuite("go", []string{"go", "test", "./..."})
+	}
+	if fileExists(filepath.Join(sd.RootDir, "manage.py")) {
+		addSuite("python", []string{"python", "manage.py", "test"})
+	} else {
+		pytest := fileExists(filepath.Join(sd.RootDir, "pytest.ini")) || fileExists(filepath.Join(sd.RootDir, "conftest.py"))
+		for _, file := range []string{"requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.cfg", "tox.ini"} {
+			data, err := os.ReadFile(filepath.Join(sd.RootDir, file))
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+			if strings.Contains(strings.ToLower(string(data)), "pytest") {
+				pytest = true
+			}
+		}
+		if pytest {
+			addSuite("python", []string{"python", "-m", "pytest"})
+		}
+	}
+	return tasks, nil
 }

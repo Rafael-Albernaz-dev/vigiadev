@@ -93,3 +93,22 @@ func TestLock_LifecycleAndStaleRecovery(t *testing.T) {
 	}
 	_ = manifest.ReleaseLock(tempDir)
 }
+
+func TestCleanVigiaDir(t *testing.T) {
+	tempDir := t.TempDir()
+	vigiaDir, err := manifest.EnsureVigiaDir(tempDir)
+	if err != nil {
+		t.Fatalf("falha ao criar pasta .vigiadev: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(vigiaDir, "dummy.txt"), []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manifest.CleanVigiaDir(tempDir); err != nil {
+		t.Fatalf("falha ao limpar .vigiadev: %v", err)
+	}
+
+	if _, err := os.Stat(vigiaDir); !os.IsNotExist(err) {
+		t.Fatalf("esperava que pasta .vigiadev tivesse sido removida")
+	}
+}

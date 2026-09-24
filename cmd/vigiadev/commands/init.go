@@ -56,6 +56,8 @@ var initCmd = &cobra.Command{
 			}
 		}
 
+		printAvailableTasks(cmd, result.Config)
+
 		fmt.Println("\n🚀 Run 'vigiadev up' to start and monitor the environment!")
 		return nil
 	},

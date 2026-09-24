@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/telemetry"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
@@ -101,6 +102,8 @@ type AppModel struct {
 	cancel       context.CancelFunc
 	restartFunc  func(service string) error
 	statusMsg    string
+	isFiltering  bool
+	filterQuery  string
 }
 
 // NewAppModel instantiates the interactive TUI model.
@@ -145,12 +148,58 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.isFiltering {
+			switch msg.String() {
+			case "esc":
+				m.isFiltering = false
+				m.filterQuery = ""
+				m.syncViewport()
+				return m, nil
+			case "enter":
+				m.isFiltering = false
+				m.syncViewport()
+				return m, nil
+			case "backspace":
+				if len(m.filterQuery) > 0 {
+					m.filterQuery = m.filterQuery[:len(m.filterQuery)-1]
+					m.syncViewport()
+				}
+				return m, nil
+			case "ctrl+c":
+				if m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			default:
+				if len(msg.Runes) > 0 {
+					m.filterQuery += string(msg.Runes)
+					m.syncViewport()
+					return m, nil
+				}
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+
+		case "/":
+			currentTab := m.tabs[m.activeTab]
+			if currentTab != "METRICS" {
+				m.isFiltering = true
+				return m, nil
+			}
+
+		case "esc":
+			if m.filterQuery != "" {
+				m.filterQuery = ""
+				m.syncViewport()
+				return m, nil
+			}
 
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % len(m.tabs)
@@ -316,6 +365,16 @@ func (m *AppModel) syncViewport() {
 		return
 	}
 	lines := m.logs[currentTab]
+	if m.filterQuery != "" {
+		query := strings.ToLower(m.filterQuery)
+		filtered := make([]string, 0, len(lines))
+		for _, l := range lines {
+			if strings.Contains(strings.ToLower(ansi.Strip(l)), query) {
+				filtered = append(filtered, l)
+			}
+		}
+		lines = filtered
+	}
 	content := strings.Join(lines, "\n")
 	m.viewport.SetContent(content)
 }
@@ -564,12 +623,42 @@ func (m *AppModel) View() string {
 	// 5. Interactive Footer
 	currentTab := m.tabs[m.activeTab]
 	var footerText string
+
+	if m.isFiltering {
+		filterPrompt := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(highlightColor).
+			Padding(0, 1).
+			Render(fmt.Sprintf("FILTER: /%s█", m.filterQuery))
+		filterHelp := lipgloss.NewStyle().Foreground(subtleColor).Render("  [Enter] Apply  •  [Esc] Clear & Exit")
+		b.WriteString(filterPrompt + filterHelp)
+		return b.String()
+	}
+
 	if currentTab != "ALL" && currentTab != "METRICS" {
-		footerText = fmt.Sprintf("[Tab/Click] Switch Tab  •  [r] RESTART '%s'  •  [c] Clear Logs  •  [q] Quit", currentTab)
+		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [r] RESTART '%s'  •  [c] Clear  •  [q] Quit", currentTab)
 	} else if currentTab == "METRICS" {
-		footerText = "[Tab/Click] Switch Tab  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
+		footerText = "[Tab/Click] Switch  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
 	} else {
-		footerText = "[Tab/Click] Switch Tab  •  [1-9] Quick Jump  •  [Scroll/Arrows] Scroll Logs  •  [q] Quit"
+		footerText = "[Tab/Click] Switch  •  [/] Filter  •  [1-9] Quick Jump  •  [Scroll/Arrows] Scroll  •  [q] Quit"
+	}
+
+	if m.filterQuery != "" && currentTab != "METRICS" {
+		matchesCount := 0
+		query := strings.ToLower(m.filterQuery)
+		for _, l := range m.logs[currentTab] {
+			if strings.Contains(strings.ToLower(ansi.Strip(l)), query) {
+				matchesCount++
+			}
+		}
+		badge := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(warningColor).
+			Padding(0, 1).
+			Render(fmt.Sprintf("FILTER: \"%s\" (%d lines)", m.filterQuery, matchesCount))
+		footerText = fmt.Sprintf("%s [Esc: Clear]  •  %s", badge, footerText)
 	}
 
 	if m.statusMsg != "" {

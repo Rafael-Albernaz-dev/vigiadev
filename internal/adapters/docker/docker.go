@@ -183,6 +183,7 @@ type ContainerInfo struct {
 	Name        string
 	Image       string
 	ServiceName string
+	State       string
 }
 
 // DockerManager gerencia containers Docker Compose, logs e telemetria.
@@ -349,6 +350,7 @@ func (dm *DockerManager) FindContainer(ctx context.Context, serviceName string, 
 					Name:        name,
 					Image:       c.Image,
 					ServiceName: serviceName,
+					State:       c.State,
 				}, nil
 			}
 		}

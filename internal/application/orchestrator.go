@@ -3,6 +3,9 @@ package application
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -263,6 +266,17 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 			case domain.PortPolicyReuse:
 				// Adota porta existente
 			}
+		}
+	}
+
+	// Injeção compulsória de TCP Readiness Probe se serviço declara portas sem healthcheck customizado (DEC-021)
+	if svc.HealthCheck == nil && len(svc.Ports) > 0 {
+		svc.HealthCheck = &domain.HealthCheckConfig{
+			Type:       domain.HealthCheckTCP,
+			Port:       assignedPort,
+			TimeoutMs:  1000,
+			IntervalMs: 250,
+			Retries:    40,
 		}
 	}
 
@@ -529,4 +543,138 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 	o.mu.Unlock()
 
 	return nil
+}
+
+// EnsureServicesHealthy garante que todos os serviços informados (e suas dependências transitivas) estejam rodando e saudáveis.
+func (o *Orchestrator) EnsureServicesHealthy(ctx context.Context, serviceNames []string) error {
+	required := make(map[string]bool)
+	var queue []string
+	for _, name := range serviceNames {
+		if _, exists := o.Config.Services[name]; exists {
+			queue = append(queue, name)
+			required[name] = true
+		}
+	}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		if svc, ok := o.Config.Services[curr]; ok {
+			for _, dep := range svc.DependsOn {
+				if !required[dep] {
+					required[dep] = true
+					queue = append(queue, dep)
+				}
+			}
+		}
+	}
+
+	for _, wave := range o.DAG.Waves {
+		for _, svcName := range wave {
+			if !required[svcName] {
+				continue
+			}
+			svcConfig := o.Config.Services[svcName]
+
+			if o.IsServiceHealthy(ctx, svcName, svcConfig) {
+				o.Bus.Publish(domain.LogLineProduced{
+					BaseEvent: domain.NewBaseEvent(),
+					Service:   svcName,
+					Line:      fmt.Sprintf("[vigiadev] Dependency '%s' is already active and healthy.", svcName),
+					IsError:   false,
+				})
+				continue
+			}
+
+			o.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   svcName,
+				Line:      fmt.Sprintf("[vigiadev] Starting dependency '%s'...", svcName),
+				IsError:   false,
+			})
+
+			if err := o.startService(ctx, svcName, svcConfig); err != nil {
+				return fmt.Errorf("failed to start dependency '%s': %w", svcName, err)
+			}
+		}
+	}
+
+	// Persiste estado intermediário no manifesto (DEC-021: keep-alive)
+	o.mu.Lock()
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+	o.mu.Unlock()
+
+	return nil
+}
+
+// IsServiceHealthy verifica se um serviço já está respondendo ao healthcheck ou socket.
+func (o *Orchestrator) IsServiceHealthy(ctx context.Context, name string, svc domain.ServiceConfig) bool {
+	// Se tem healthcheck customizado, testa
+	if svc.HealthCheck != nil {
+		err := o.Health.CheckSingle(ctx, svc.HealthCheck, "127.0.0.1")
+		if err == nil {
+			return true
+		}
+	}
+
+	// Se declara portas, testa conexão TCP na porta
+	if len(svc.Ports) > 0 {
+		port := svc.Ports[0]
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+	}
+
+	// Se é container compose, checa com DockerManager se está rodando
+	if svc.ComposeService != "" && o.Docker != nil {
+		info, err := o.Docker.FindContainer(ctx, name, o.WorkDir)
+		if err == nil && info != nil && info.State == "running" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// RunTask executa uma tarefa declarada em tasks: com resolução de dependências e repasse de exit code.
+func (o *Orchestrator) RunTask(ctx context.Context, taskName string, extraArgs []string, noDeps bool) (int, error) {
+	task, exists := o.Config.Tasks[taskName]
+	if !exists {
+		return 1, fmt.Errorf("task '%s' not found in configuration", taskName)
+	}
+
+	if !noDeps && len(task.DependsOn) > 0 {
+		if err := o.EnsureServicesHealthy(ctx, task.DependsOn); err != nil {
+			return 1, fmt.Errorf("failed to satisfy dependencies for task '%s': %w", taskName, err)
+		}
+	}
+
+	cmdParts := append([]string{}, task.Command...)
+	cmdParts = append(cmdParts, extraArgs...)
+	if len(cmdParts) == 0 {
+		return 1, fmt.Errorf("task '%s' has an empty command", taskName)
+	}
+
+	env := os.Environ()
+	for k, v := range task.Env {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	execCmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	execCmd.Dir = o.WorkDir
+	execCmd.Env = env
+	execCmd.Stdin = os.Stdin
+	execCmd.Stdout = os.Stdout
+	execCmd.Stderr = os.Stderr
+
+	err := execCmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, err
+	}
+
+	return 0, nil
 }

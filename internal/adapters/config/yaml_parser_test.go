@@ -164,3 +164,77 @@ func TestLoadConfig_ValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfig_Tasks(t *testing.T) {
+	tempDir := t.TempDir()
+
+	content := `
+version: 1
+project_name: task-test
+services:
+  db:
+    command: ["postgres"]
+tasks:
+  migrate:
+    command: "npx prisma migrate deploy"
+    depends_on: [db]
+    env:
+      DB_HOST: "127.0.0.1"
+  seed:
+    command: ["node", "seed.js"]
+    depends_on: [db]
+`
+	path := filepath.Join(tempDir, "vigiadev.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("falha ao carregar config com tasks: %v", err)
+	}
+
+	if len(cfg.Tasks) != 2 {
+		t.Fatalf("esperava 2 tasks, obteve %d", len(cfg.Tasks))
+	}
+
+	migrate, exists := cfg.Tasks["migrate"]
+	if !exists {
+		t.Fatal("task 'migrate' não encontrada")
+	}
+	if len(migrate.Command) != 4 || migrate.Command[0] != "npx" || migrate.Command[3] != "deploy" {
+		t.Errorf("esperava command split de string ['npx', 'prisma', 'migrate', 'deploy'], obteve %v", migrate.Command)
+	}
+	if len(migrate.DependsOn) != 1 || migrate.DependsOn[0] != "db" {
+		t.Errorf("esperava depends_on [db], obteve %v", migrate.DependsOn)
+	}
+	if migrate.Env["DB_HOST"] != "127.0.0.1" {
+		t.Errorf("esperava env DB_HOST=127.0.0.1, obteve %v", migrate.Env)
+	}
+
+	seed, exists := cfg.Tasks["seed"]
+	if !exists {
+		t.Fatal("task 'seed' não encontrada")
+	}
+	if len(seed.Command) != 2 || seed.Command[0] != "node" || seed.Command[1] != "seed.js" {
+		t.Errorf("esperava command ['node', 'seed.js'], obteve %v", seed.Command)
+	}
+
+	// Cenário de erro: task com depends_on inexistente
+	badContent := `
+version: 1
+project_name: task-test
+services:
+  app:
+    command: ["node", "server.js"]
+tasks:
+  broken:
+    command: "run"
+    depends_on: [nonexistent]
+`
+	badPath := filepath.Join(tempDir, "bad.yaml")
+	_ = os.WriteFile(badPath, []byte(badContent), 0644)
+	if _, err := config.LoadConfig(badPath); err == nil {
+		t.Error("esperava erro ao referenciar serviço inexistente em depends_on de task")
+	}
+}

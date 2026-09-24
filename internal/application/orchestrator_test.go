@@ -510,3 +510,98 @@ func TestOrchestrator_FileWatchReload(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_CompulsoryTCPProbe(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Inicia um listener TCP real para simular um serviço com porta
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	port := l.Addr().(*net.TCPAddr).Port
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "probe-test",
+		Services: map[string]domain.ServiceConfig{
+			"db": {
+				Command: []string{"sleep", "5"},
+				Ports:   []int{port},
+				// HealthCheck é nil propositalmente para testar injeção automática
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatalf("failed to create orchestrator: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// EnsureServicesHealthy deve rodar probe TCP e detectar que a porta responde
+	err = orch.EnsureServicesHealthy(ctx, []string{"db"})
+	if err != nil {
+		t.Fatalf("EnsureServicesHealthy falhou: %v", err)
+	}
+}
+
+func TestOrchestrator_RunTask(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "task-runner-test",
+		Services: map[string]domain.ServiceConfig{
+			"app": {
+				Command: []string{"sleep", "1"},
+			},
+		},
+		Tasks: map[string]domain.TaskConfig{
+			"echo-task": {
+				Command: []string{"echo", "hello-task"},
+				Env: map[string]string{
+					"CUSTOM_VAR": "vigia-ok",
+				},
+			},
+			"failing-task": {
+				Command: []string{"false"},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatalf("failed to create orchestrator: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Executa echo-task com sucesso
+	exitCode, err := orch.RunTask(ctx, "echo-task", []string{"extra-arg"}, false)
+	if err != nil {
+		t.Fatalf("RunTask retornou erro: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("esperava exitCode 0, obteve %d", exitCode)
+	}
+
+	// 2. Executa task com falha e confere repasse de exit code
+	exitCode, err = orch.RunTask(ctx, "failing-task", nil, false)
+	if exitCode == 0 {
+		t.Errorf("esperava exitCode diferente de 0 para failing-task, obteve %d", exitCode)
+	}
+
+	// 3. Task inexistente
+	_, err = orch.RunTask(ctx, "nonexistent", nil, false)
+	if err == nil {
+		t.Error("esperava erro para task inexistente")
+	}
+}
+
+

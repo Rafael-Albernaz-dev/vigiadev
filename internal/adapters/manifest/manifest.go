@@ -127,3 +127,9 @@ func ReleaseLock(workDir string) error {
 	}
 	return err
 }
+
+// CleanVigiaDir remove todo o diretório .vigiadev do projeto.
+func CleanVigiaDir(workDir string) error {
+	dir := filepath.Join(workDir, VigiaDir)
+	return os.RemoveAll(dir)
+}
