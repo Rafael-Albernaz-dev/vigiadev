@@ -1,0 +1,30 @@
+version: 2
+
+project_name: vigiadev
+
+builds:
+  - id: vigiadev
+    main: ./cmd/vigiadev
+    binary: vigiadev
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/Rafael-Albernaz-dev/vigiadev/cmd/vigiadev/commands.Version={{.Version}}
+        -X github.com/Rafael-Albernaz-dev/vigiadev/cmd/vigiadev/commands.Commit={{.Commit}}
+        -X github.com/Rafael-Albernaz-dev/vigiadev/cmd/vigiadev/commands.BuildDate={{.Date}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256

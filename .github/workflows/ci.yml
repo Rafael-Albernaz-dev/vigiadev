@@ -4,14 +4,15 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
         with:
-          python-version: "3.10"
-      - run: uv sync --extra dev
-      - run: uv run pytest
-
+          go-version-file: go.mod
+      - run: go test -v ./...
