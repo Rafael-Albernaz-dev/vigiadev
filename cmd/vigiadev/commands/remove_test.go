@@ -1,6 +1,7 @@
 package commands_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/cmd/vigiadev/commands"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 )
 
 func TestRunRemove_AllFiles(t *testing.T) {
@@ -118,5 +120,43 @@ func TestRunRemove_ConfirmationAccepted(t *testing.T) {
 	// File should be deleted
 	if _, err := os.Stat(cfg); !os.IsNotExist(err) {
 		t.Errorf("expected vigiadev.yaml to be deleted on confirmation")
+	}
+}
+
+func TestRemove_ResidualPortCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name, input       string
+		force, keep, kill bool
+	}{
+		{"yes", "y\ny\n", false, false, true}, {"no", "y\nn\n", false, false, false}, {"enter", "y\n\n", false, false, false},
+		{"eof", "y\n", false, false, false}, {"force", "", true, false, true}, {"keep", "y\ny\n", false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child, port := conflictChild(t)
+			dir := t.TempDir()
+			file := filepath.Join(dir, "vigiadev.yaml")
+			data := fmt.Sprintf("version: 1\nproject_name: residual\nservices:\n  web:\n    command: [server]\n    ports: [%d]\n", port)
+			if err := os.WriteFile(file, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := commands.RunRemove(dir, tc.force, tc.keep, "", strings.NewReader(tc.input)); err != nil {
+				t.Fatal(err)
+			}
+			if ports.NewPortResolver("").IsPortAvailable(port) != tc.kill {
+				t.Fatal("unexpected residual listener state")
+			}
+			_, err := os.Stat(file)
+			if tc.keep && err != nil {
+				t.Fatal("config not preserved")
+			}
+			if !tc.keep && !os.IsNotExist(err) {
+				t.Fatal("config not removed")
+			}
+			if tc.kill {
+				if err := child.Wait(); err == nil {
+					t.Fatal("expected signal termination")
+				}
+			}
+		})
 	}
 }

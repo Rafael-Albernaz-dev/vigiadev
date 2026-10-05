@@ -6,9 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/spf13/cobra"
 )
 
@@ -26,12 +30,12 @@ var knownConfigFiles = []string{
 
 // RunRemove executes the removal of vigiaDev runtime state, active sessions, and configuration files.
 func RunRemove(cwd string, force bool, keepConf bool, explicitConfig string, inReader io.Reader) error {
+	if inReader == nil {
+		inReader = os.Stdin
+	}
+	reader := bufio.NewReader(inReader)
 	if !force {
 		fmt.Print("⚠️  This will stop any active sessions and delete all vigiaDev files (.vigiadev/ and configs). Proceed? [y/N]: ")
-		if inReader == nil {
-			inReader = os.Stdin
-		}
-		reader := bufio.NewReader(inReader)
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Println("\nOperation cancelled.")
@@ -50,6 +54,10 @@ func RunRemove(cwd string, force bool, keepConf bool, explicitConfig string, inR
 		if err := StopSession(cwd); err != nil {
 			fmt.Printf("⚠️  Warning during session teardown: %v\n", err)
 		}
+	}
+
+	if err := cleanupResidualPorts(cwd, explicitConfig, force, reader, os.Stdout); err != nil {
+		return err
 	}
 
 	// 2. Remove .vigiadev runtime directory
@@ -119,7 +127,7 @@ var removeCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		return RunRemove(cwd, forceRemove, keepConfig, cfgFile, os.Stdin)
+		return RunRemove(cwd, forceRemove, keepConfig, cfgFile, cmd.InOrStdin())
 	},
 }
 
@@ -128,4 +136,68 @@ func init() {
 	removeCmd.Flags().BoolVarP(&forceRemove, "yes", "y", false, "Alias for --force")
 	removeCmd.Flags().BoolVar(&keepConfig, "keep-config", false, "Remove only runtime session files (.vigiadev/) and keep YAML configuration files")
 	rootCmd.AddCommand(removeCmd)
+}
+
+// cleanupResidualPorts inspects configuration before it is removed, even with --keep-config.
+func cleanupResidualPorts(cwd, explicit string, force bool, reader *bufio.Reader, out io.Writer) error {
+	targets := append([]string{}, knownConfigFiles...)
+	targets = append(targets, "dev.yaml")
+	if explicit != "" {
+		targets = append(targets, explicit)
+	}
+	globs, err := filepath.Glob(filepath.Join(cwd, "vigiadev*.y*ml"))
+	if err != nil {
+		return err
+	}
+	targets = append(targets, globs...)
+	seenFiles, seenPorts := make(map[string]bool), make(map[int]bool)
+	var configured []int
+	for _, target := range targets {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(cwd, target)
+		}
+		target = filepath.Clean(target)
+		if seenFiles[target] {
+			continue
+		}
+		seenFiles[target] = true
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			continue
+		}
+		cfg, err := config.LoadConfig(target)
+		if err != nil {
+			fmt.Fprintf(out, "⚠️  Cannot inspect ports in %s: %v\n", filepath.Base(target), err)
+			continue
+		}
+		for _, svc := range cfg.Services {
+			for _, p := range svc.Ports {
+				if !seenPorts[p] {
+					seenPorts[p] = true
+					configured = append(configured, p)
+				}
+			}
+		}
+	}
+	sort.Ints(configured)
+	for _, port := range configured {
+		if ports.NewPortResolver("").IsPortAvailable(port) {
+			continue
+		}
+		info, err := ports.FindProcessByPort(port)
+		if err != nil {
+			return fmt.Errorf("cannot inspect residual port %d: %w", port, err)
+		}
+		confirmed := force
+		if !force {
+			fmt.Fprintf(out, "⚠️  Port %d is still occupied by residual process PID %d. Kill it? [y/N]: ", port, info.PID)
+			answer, err := reader.ReadString('\n')
+			confirmed = err == nil && (strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"))
+		}
+		if confirmed {
+			if err := ports.KillProcessOnPort(port, info, 500*time.Millisecond); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

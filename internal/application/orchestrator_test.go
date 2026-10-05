@@ -1,18 +1,24 @@
 package application_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 	"github.com/docker/docker/api/types"
@@ -685,5 +691,143 @@ func TestOrchestrator_RunTask(t *testing.T) {
 	_, err = orch.RunTask(ctx, "nonexistent", nil, false)
 	if err == nil {
 		t.Error("esperava erro para task inexistente")
+	}
+}
+
+func TestOrchestratorPortServer(t *testing.T) {
+	if os.Getenv("VIGIA_ORCH_SERVER") != "1" {
+		return
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "0"
+	}
+	l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", port))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(l.Addr().(*net.TCPAddr).Port)
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			panic(err)
+		}
+		c.Close()
+	}
+}
+
+func TestOrchestrator_PortPolicies(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		policy      domain.PortPolicy
+		allow, busy bool
+	}{
+		{"remap-env-only", domain.PortPolicyRemap, false, true}, {"remap-free-env", domain.PortPolicyRemap, false, false},
+		{"kill-authorized", domain.PortPolicyKill, true, true}, {"kill-refused", domain.PortPolicyKill, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := exec.Command(os.Args[0], "-test.run=^TestOrchestratorPortServer$")
+			child.Env = append(os.Environ(), "VIGIA_ORCH_SERVER=1", "PORT=0")
+			stdout, err := child.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = child.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+			line, err := bufio.NewReader(stdout).ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			port, err := strconv.Atoi(strings.TrimSpace(line))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.busy {
+				_ = child.Process.Kill()
+				_ = child.Wait()
+			}
+			cfg := &domain.VigiaConfig{Version: 1, ProjectName: "port-policy", Services: map[string]domain.ServiceConfig{
+				"web": {Command: []string{os.Args[0], "-test.run=^TestOrchestratorPortServer$"}, Ports: []int{port}, PortPolicy: tc.policy, Env: map[string]string{"VIGIA_ORCH_SERVER": "1", "PORT": strconv.Itoa(port)}},
+			}}
+			if tc.policy == domain.PortPolicyKill {
+				svc := cfg.Services["web"]
+				svc.Env["PORT"] = "{port}"
+				svc.HealthCheck = &domain.HealthCheckConfig{Type: domain.HealthCheckTCP, Port: port}
+				cfg.Services["web"] = svc
+			}
+			bus := domain.NewEventBus()
+			healthy := make(chan bool, 1)
+			remapped := make(chan int, 1)
+			bus.Subscribe(func(e domain.Event) {
+				if evt, ok := e.(domain.ServiceStateChanged); ok && evt.NewState == domain.StateHealthy {
+					healthy <- true
+				}
+				if evt, ok := e.(domain.PortRemapped); ok {
+					remapped <- evt.TargetPort
+				}
+			})
+			orch, err := application.NewOrchestrator(cfg, t.TempDir(), bus)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(orch.Close)
+			orch.AllowPortKill = tc.allow
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- orch.Run(ctx) }()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("orchestrator did not stop")
+				}
+			})
+			if tc.policy == domain.PortPolicyKill && !tc.allow {
+				select {
+				case err := <-done:
+					if err == nil || !strings.Contains(err.Error(), "requires explicit confirmation") {
+						t.Fatalf("expected authorization error: %v", err)
+					}
+					done <- err
+				case <-time.After(3 * time.Second):
+					t.Fatal("kill refusal timed out")
+				}
+				if ports.NewPortResolver("").IsPortAvailable(port) {
+					t.Fatal("unauthorized kill")
+				}
+				return
+			}
+			select {
+			case <-healthy:
+			case err := <-done:
+				done <- err
+				t.Fatalf("startup failed: %v", err)
+			case <-time.After(4 * time.Second):
+				t.Fatal("server did not become healthy using PORT")
+			}
+			if tc.policy == domain.PortPolicyRemap && tc.busy {
+				select {
+				case assigned := <-remapped:
+					if assigned <= port || ports.NewPortResolver("").IsPortAvailable(assigned) {
+						t.Fatal("remapped server not listening")
+					}
+				default:
+					t.Fatal("missing remap event")
+				}
+				info, err := ports.FindProcessByPort(port)
+				if err != nil || info.PID != child.Process.Pid {
+					t.Fatalf("original listener changed: %v", err)
+				}
+			}
+			if tc.allow {
+				info, err := ports.FindProcessByPort(port)
+				if err != nil || info.PID == child.Process.Pid {
+					t.Fatalf("original listener was not replaced: %v", err)
+				}
+			}
+		})
 	}
 }

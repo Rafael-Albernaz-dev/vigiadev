@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
 
 func TestIsPortAvailable(t *testing.T) {
@@ -83,5 +84,20 @@ func TestInterpolations(t *testing.T) {
 
 	if !reflect.DeepEqual(interpolatedEnv, expectedEnv) {
 		t.Errorf("esperava %v, obteve %v", expectedEnv, interpolatedEnv)
+	}
+}
+
+func TestRemapServiceCopiesAndInterpolates(t *testing.T) {
+	original := domain.ServiceConfig{Ports: []int{3000}, Command: []string{"server", "{port}"}, Env: map[string]string{"PORT": "3000"}, HealthCheck: &domain.HealthCheckConfig{Port: 3000, Command: []string{"probe", "{port}"}, URL: "http://localhost:{port}"}}
+	assigned := ports.RemapService(original, 0, 3001)
+	if assigned.Env["PORT"] != "3001" || assigned.HealthCheck.Command[1] != "3001" || assigned.HealthCheck.URL != "http://localhost:3001" {
+		t.Fatalf("incomplete remap: %+v", assigned)
+	}
+	if original.Ports[0] != 3000 || original.Env["PORT"] != "3000" || original.Command[1] != "{port}" || original.HealthCheck.Port != 3000 {
+		t.Fatal("remap mutated input")
+	}
+	noEnv := ports.RemapService(domain.ServiceConfig{Ports: []int{3000}}, 0, 3001)
+	if noEnv.Env["PORT"] != "3001" {
+		t.Fatal("missing PORT with nil env")
 	}
 }

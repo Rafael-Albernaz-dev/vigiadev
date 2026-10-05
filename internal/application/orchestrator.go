@@ -33,10 +33,13 @@ type Orchestrator struct {
 	Watcher    *watcher.ServiceWatcher
 	WorkDir    string
 	RunID      string
-	manifest   *manifest.RunManifest
-	mu         sync.Mutex
-	closeLogs  func()
-	closeOnce  sync.Once
+	// AllowPortKill must only be set after explicit automation authorization.
+	AllowPortKill     bool
+	InitialPortRemaps []domain.PortRemapped
+	manifest          *manifest.RunManifest
+	mu                sync.Mutex
+	closeLogs         func()
+	closeOnce         sync.Once
 }
 
 // NewOrchestrator cria e valida as dependências do orquestrador.
@@ -158,7 +161,7 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 		Config:     cfg,
 		DAG:        dag,
 		Bus:        bus,
-		Ports:      ports.NewPortResolver("127.0.0.1"),
+		Ports:      ports.NewPortResolver(""),
 		Supervisor: process.NewSupervisor(bus),
 		Health:     health.NewChecker(),
 		Telemetry:  telemetry.NewCollector(bus, 1*time.Second),
@@ -283,6 +286,9 @@ func (o *Orchestrator) Close() {
 
 // Run executa as ondas do DAG, aguarda cancelamento e faz teardown gracioso.
 func (o *Orchestrator) Run(ctx context.Context) error {
+	for _, event := range o.InitialPortRemaps {
+		o.Bus.Publish(event)
+	}
 	defer o.Close()
 	// 1. Garante trava exclusiva de execução
 	if err := manifest.AcquireLock(o.WorkDir); err != nil {
@@ -380,18 +386,8 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 				}
 				assignedPort = freePort
 
-				// Interpolação declarativa
-				effectiveCmd = ports.InterpolateCommand(svc.Command, assignedPort)
-				effectiveEnv = ports.InterpolateEnv(svc.Env, assignedPort)
-
-				if svc.HealthCheck != nil {
-					if svc.HealthCheck.Port == origPort {
-						svc.HealthCheck.Port = assignedPort
-					}
-					if svc.HealthCheck.URL != "" {
-						svc.HealthCheck.URL = ports.InterpolatePort(svc.HealthCheck.URL, assignedPort)
-					}
-				}
+				svc = ports.RemapService(svc, 0, assignedPort)
+				effectiveCmd, effectiveEnv = svc.Command, svc.Env
 
 				// Notifica ouvintes
 				o.Bus.Publish(domain.PortRemapped{
@@ -401,6 +397,17 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 					TargetPort:   assignedPort,
 				})
 
+			case domain.PortPolicyKill:
+				if !o.AllowPortKill {
+					return fmt.Errorf("port %d: kill policy requires explicit confirmation or --force", origPort)
+				}
+				info, err := ports.FindProcessByPort(origPort)
+				if err != nil {
+					return err
+				}
+				if err := ports.KillProcessOnPort(origPort, info, 500*time.Millisecond); err != nil {
+					return err
+				}
 			case domain.PortPolicyFail:
 				return &domain.PortConflictError{
 					Service: name,
@@ -410,6 +417,20 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 			case domain.PortPolicyReuse:
 				// Adota porta existente
 			}
+		}
+	}
+
+	if assignedPort > 0 {
+		effectiveCmd = ports.InterpolateCommand(effectiveCmd, assignedPort)
+		effectiveEnv = ports.InterpolateEnv(effectiveEnv, assignedPort)
+		if svc.PortPolicy == domain.PortPolicyRemap {
+			effectiveEnv["PORT"] = fmt.Sprint(assignedPort)
+		}
+		if svc.HealthCheck != nil {
+			hc := *svc.HealthCheck
+			hc.URL = ports.InterpolatePort(hc.URL, assignedPort)
+			hc.Command = ports.InterpolateCommand(hc.Command, assignedPort)
+			svc.HealthCheck = &hc
 		}
 	}
 
