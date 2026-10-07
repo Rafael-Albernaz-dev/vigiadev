@@ -63,6 +63,8 @@ func TestDetect_NodeJS_Vite_Pnpm(t *testing.T) {
     "vite": "^5.0.0"
   }
 }
+
+
 `
 	if err := os.WriteFile(filepath.Join(tempDir, "package.json"), []byte(pkgJSON), 0644); err != nil {
 		t.Fatal(err)
@@ -92,6 +94,34 @@ func TestDetect_NodeJS_Vite_Pnpm(t *testing.T) {
 
 	if front.PortPolicy != domain.PortPolicyRemap {
 		t.Errorf("esperava port_policy remap, obteve %s", front.PortPolicy)
+	}
+}
+
+func TestDetectNodeJS_ExplicitPortArg(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+		port         int
+	}{
+		{"long", "vite --port 5187", 5187},
+		{"short", "vite -p 4187", 4187},
+		{"equals", "vite --port=5188", 5188},
+		{"invalid", "vite --port 99999", 5173},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pkg := `{"scripts":{"dev":"` + tc.script + `"},"devDependencies":{"vite":"^5"}}`
+			if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkg), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := detector.NewStackDetector(dir).Detect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			svc := result.Config.Services["frontend"]
+			if len(svc.Ports) != 1 || svc.Ports[0] != tc.port || svc.HealthCheck == nil || svc.HealthCheck.Port != tc.port {
+				t.Fatalf("explicit port not reflected in service: %+v", svc)
+			}
+		})
 	}
 }
 
@@ -251,5 +281,48 @@ func TestGenerateYAML_WithTasks(t *testing.T) {
 	}
 	if got := strings.Join(loaded.Tasks["test"].Command, " "); got != "go test ./..." {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDetect_DockerCompose_PublishedHostPorts(t *testing.T) {
+	dir := t.TempDir()
+	composeYAML := `
+services:
+  zitadel-postgres:
+    image: postgres:17-alpine
+    ports:
+      - '127.0.0.1:5434:5432'
+  db:
+    image: postgres:17
+    ports:
+      - '5432:5432'
+  minio:
+    image: minio/minio
+    ports:
+      - '9000-9001:9000-9001'
+  gateway:
+    image: nginx:alpine
+    ports:
+      - 8080
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(composeYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svcs := result.Config.Services
+	if svcs["zitadel-postgres"].Ports[0] != 5434 {
+		t.Fatalf("expected host port 5434 for zitadel-postgres, got %v", svcs["zitadel-postgres"].Ports)
+	}
+	if svcs["db"].Ports[0] != 5432 {
+		t.Fatalf("expected host port 5432 for db, got %v", svcs["db"].Ports)
+	}
+	if svcs["minio"].Ports[0] != 9000 {
+		t.Fatalf("expected host port 9000 for minio, got %v", svcs["minio"].Ports)
+	}
+	if svcs["gateway"].Ports[0] != 8080 {
+		t.Fatalf("expected host port 8080 for gateway, got %v", svcs["gateway"].Ports)
 	}
 }

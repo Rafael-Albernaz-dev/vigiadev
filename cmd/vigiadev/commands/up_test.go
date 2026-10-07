@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/cmd/vigiadev/commands"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
@@ -71,57 +72,97 @@ func conflictConfig(port int) *domain.VigiaConfig {
 }
 
 func TestUp_PortConflictResolution(t *testing.T) {
-	for _, answer := range []string{"y", "yes", "r", "remap", "n", "no", "", "invalid", "EOF"} {
-		t.Run(answer, func(t *testing.T) {
-			child, port := conflictChild(t)
-			cfg := conflictConfig(port)
-			input := answer + "\n"
-			if answer == "EOF" {
-				input = "y"
-			}
-			var output bytes.Buffer
-			expectedPort, err := ports.NewPortResolver("").FindAvailablePort(port, 50)
-			if err != nil {
-				t.Fatal(err)
-			}
-			events, err := commands.PreflightPorts(cfg, strings.NewReader(input), &output, true, false, false)
-			if !strings.Contains(output.String(), fmt.Sprintf("PID %d", child.Process.Pid)) || !strings.Contains(output.String(), "[y/N/remap]") {
-				t.Fatalf("missing prompt: %s", &output)
-			}
-			switch answer {
-			case "y", "yes":
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !ports.NewPortResolver("").IsPortAvailable(port) {
-					t.Fatal("port not released")
-				}
-				if err := child.Wait(); err == nil {
-					t.Fatal("process did not terminate by signal")
-				}
-			case "r", "remap":
-				if err != nil {
-					t.Fatal(err)
-				}
-				svc := cfg.Services["web"]
-				if svc.Ports[0] != expectedPort || svc.Env["PORT"] != strconv.Itoa(expectedPort) || svc.Command[1] != strconv.Itoa(expectedPort) || svc.HealthCheck.Port != expectedPort || svc.HealthCheck.Command[1] != strconv.Itoa(expectedPort) || !strings.HasSuffix(svc.HealthCheck.URL, strconv.Itoa(expectedPort)) {
-					t.Fatalf("remap incomplete: %+v", svc)
-				}
-				if len(events) != 1 || events[0].OriginalPort != port || events[0].TargetPort != expectedPort {
-					t.Fatalf("remap event: %v", events)
-				}
-				if ports.NewPortResolver("").IsPortAvailable(port) {
-					t.Fatal("remap killed original listener")
-				}
-			default:
-				if err == nil || err.Error() != "Operation cancelled due to port conflict." {
-					t.Fatalf("expected cancellation: %v", err)
-				}
-				if ports.NewPortResolver("").IsPortAvailable(port) {
-					t.Fatal("cancel killed original listener")
-				}
-			}
-		})
+	_, port := conflictChild(t)
+	cfg := conflictConfig(port)
+	var output bytes.Buffer
+	_, err := commands.PreflightPorts(cfg, strings.NewReader("yes\n"), &output, true, false, false)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("port %d is occupied", port)) {
+		t.Fatalf("expected a clear conflict: %v", err)
+	}
+	if output.Len() != 0 || ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatalf("zero-flag preflight prompted or killed listener: %q", &output)
+	}
+}
+
+func TestPreflightPorts_ReusePolicy(t *testing.T) {
+	_, port := conflictChild(t)
+	cfg := conflictConfig(port)
+	svc := cfg.Services["web"]
+	svc.PortPolicy = domain.PortPolicyReuse
+	svc.ComposeService = "db"
+	cfg.Services["web"] = svc
+	var out bytes.Buffer
+	events, err := commands.PreflightPorts(cfg, strings.NewReader(""), &out, false, false, false)
+	if err != nil || len(events) != 0 || out.Len() != 0 || cfg.Services["web"].Ports[0] != port || cfg.Services["web"].PortPolicy != domain.PortPolicyReuse {
+		t.Fatalf("reuse changed: events=%v err=%v output=%q service=%+v", events, err, &out, cfg.Services["web"])
+	}
+}
+
+func TestPreflightPorts_AutoRemapZeroFlags(t *testing.T) {
+	_, port := conflictChild(t)
+	cfg := conflictConfig(port)
+	svc := cfg.Services["web"]
+	svc.PortPolicy = domain.PortPolicyRemap
+	cfg.Services["web"] = svc
+	var out bytes.Buffer
+	events, err := commands.PreflightPorts(cfg, strings.NewReader(""), &out, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Services["web"]
+	if out.Len() != 0 || len(events) != 1 || got.Ports[0] <= port || got.Env["PORT"] != strconv.Itoa(got.Ports[0]) || got.Command[1] != strconv.Itoa(got.Ports[0]) || got.HealthCheck.Port != got.Ports[0] || got.HealthCheck.Command[1] != strconv.Itoa(got.Ports[0]) || !strings.HasSuffix(got.HealthCheck.URL, strconv.Itoa(got.Ports[0])) {
+		t.Fatalf("automatic remap incomplete: events=%v output=%q service=%+v", events, &out, got)
+	}
+	if ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("original listener was terminated")
+	}
+}
+
+func TestUp_ReapOrphanedProcesses(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPortConflictListenerHelper$")
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "VIGIA_CONFLICT_HELPER=1", "PORT=0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.RunManifest{RunID: "old-run", ProjectName: "test", Services: map[string]manifest.ServiceManifest{
+		"web": {Name: "web", PID: cmd.Process.Pid, PGID: cmd.Process.Pid, Port: port},
+	}}
+	if err := manifest.WriteManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, manifest.VigiaDir, manifest.LockFile), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commands.ReapOrphanedProcesses(dir, "test"); err == nil || ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatalf("active session was not protected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, manifest.VigiaDir, manifest.LockFile), []byte("99999999"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commands.ReapOrphanedProcesses(dir, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if !ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("orphaned listener remains active")
+	}
+	if _, err := manifest.ReadManifest(dir); !os.IsNotExist(err) {
+		t.Fatalf("stale manifest remains: %v", err)
 	}
 }
 
@@ -143,7 +184,7 @@ func TestUp_KillPortsFlag(t *testing.T) {
 			if ports.NewPortResolver("").IsPortAvailable(port) != tc.wantKill {
 				t.Fatal("unexpected listener state")
 			}
-			wantsPrompt := tc.interactive && !tc.force
+			wantsPrompt := tc.interactive && !tc.force && tc.kill
 			if strings.Contains(out.String(), "Proceed to kill? [y/N]") != wantsPrompt {
 				t.Fatalf("unexpected prompt: %s", &out)
 			}
@@ -163,8 +204,11 @@ func TestUp_ReservesDeclaredPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := conflictConfig(port)
+	svc := cfg.Services["web"]
+	svc.PortPolicy = domain.PortPolicyRemap
+	cfg.Services["web"] = svc
 	cfg.Services["other"] = domain.ServiceConfig{Ports: []int{next}}
-	_, err = commands.PreflightPorts(cfg, strings.NewReader("remap\n"), nil, true, false, false)
+	_, err = commands.PreflightPorts(cfg, strings.NewReader(""), nil, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +245,7 @@ func TestUp_KillPortsFlagCLI(t *testing.T) {
 		t.Run(flags, func(t *testing.T) {
 			original, port := conflictChild(t)
 			dir := t.TempDir()
-			cfg := fmt.Sprintf("version: 1\nproject_name: cli\nservices:\n  web:\n    command: [%q, '-test.run=^TestPortConflictListenerHelper$']\n    ports: [%d]\n    env:\n      VIGIA_CONFLICT_HELPER: '1'\n      PORT: '%d'\n", os.Args[0], port, port)
+			cfg := fmt.Sprintf("version: 1\nproject_name: cli\nservices:\n  web:\n    command: [%q, '-test.run=^TestPortConflictListenerHelper$']\n    ports: [%d]\n    port_policy: fail\n    env:\n      VIGIA_CONFLICT_HELPER: '1'\n      PORT: '%d'\n", os.Args[0], port, port)
 			if err := os.WriteFile(filepath.Join(dir, "vigiadev.yaml"), []byte(cfg), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -266,7 +310,7 @@ func TestUp_DeclarativePoliciesAndAllPorts(t *testing.T) {
 		svc := cfg.Services["web"]
 		svc.PortPolicy = domain.PortPolicyKill
 		cfg.Services["web"] = svc
-		if _, err := commands.PreflightPorts(cfg, nil, nil, false, true, false); err != nil {
+		if _, err := commands.PreflightPorts(cfg, nil, nil, false, true, true); err != nil {
 			t.Fatal(err)
 		}
 		if err := child.Wait(); err == nil {
@@ -292,4 +336,44 @@ func TestUp_DeclarativePoliciesAndAllPorts(t *testing.T) {
 			t.Fatal("listener killed on refusal")
 		}
 	})
+}
+
+func TestFilterServices(t *testing.T) {
+	cfg := &domain.VigiaConfig{
+		ProjectName: "demo",
+		Services: map[string]domain.ServiceConfig{
+			"db":       {Command: []string{"db"}},
+			"backend":  {Command: []string{"api"}, DependsOn: []string{"db"}},
+			"frontend": {Command: []string{"web"}, DependsOn: []string{"backend"}},
+			"worker":   {Command: []string{"worker"}, DependsOn: []string{"db"}},
+			"extra":    {Command: []string{"extra"}},
+		},
+	}
+
+	// 1. Sem targets retorna todos
+	all, err := commands.FilterServices(cfg, nil)
+	if err != nil || len(all.Services) != 5 {
+		t.Fatalf("expected all services, got %v", all.Services)
+	}
+
+	// 2. Filtrando apenas "frontend": deve trazer "frontend", "backend" e "db" (transitivas)
+	filtered, err := commands.FilterServices(cfg, []string{"frontend"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Services) != 3 {
+		t.Fatalf("expected 3 services (frontend, backend, db), got %d: %v", len(filtered.Services), filtered.Services)
+	}
+	if _, ok := filtered.Services["worker"]; ok {
+		t.Fatal("worker should not be in filtered services")
+	}
+	if _, ok := filtered.Services["extra"]; ok {
+		t.Fatal("extra should not be in filtered services")
+	}
+
+	// 3. Serviço inexistente retorna erro com lista de disponíveis
+	_, err = commands.FilterServices(cfg, []string{"nonexistent"})
+	if err == nil || !strings.Contains(err.Error(), "Available services:") {
+		t.Fatalf("expected error listing available services, got: %v", err)
+	}
 }

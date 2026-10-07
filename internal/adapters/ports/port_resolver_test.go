@@ -101,3 +101,37 @@ func TestRemapServiceCopiesAndInterpolates(t *testing.T) {
 		t.Fatal("missing PORT with nil env")
 	}
 }
+
+func TestApplyPortOverride_CliOverrides(t *testing.T) {
+	// 1. npm run dev sem porta explícita -> adiciona -- --port 5188
+	npmCmd := []string{"npm", "run", "dev"}
+	gotNpm := ports.ApplyPortOverride(npmCmd, 5188)
+	wantNpm := []string{"npm", "run", "dev", "--", "--port", "5188"}
+	if !reflect.DeepEqual(gotNpm, wantNpm) {
+		t.Fatalf("expected %v, got %v", wantNpm, gotNpm)
+	}
+
+	// 2. comando com --port explícito -> substitui porta
+	viteCmd := []string{"vite", "--port", "5173", "--host", "127.0.0.1"}
+	gotVite := ports.ApplyPortOverride(viteCmd, 5188)
+	wantVite := []string{"vite", "--port", "5188", "--host", "127.0.0.1"}
+	if !reflect.DeepEqual(gotVite, wantVite) {
+		t.Fatalf("expected %v, got %v", wantVite, gotVite)
+	}
+
+	// 3. comando com --port=5173
+	viteEqCmd := []string{"vite", "--port=5173"}
+	gotViteEq := ports.ApplyPortOverride(viteEqCmd, 5188)
+	wantViteEq := []string{"vite", "--port=5188"}
+	if !reflect.DeepEqual(gotViteEq, wantViteEq) {
+		t.Fatalf("expected %v, got %v", wantViteEq, gotViteEq)
+	}
+
+	// 4. comando com placeholder {port}
+	customCmd := []string{"python", "manage.py", "runserver", "0.0.0.0:{port}"}
+	gotCustom := ports.ApplyPortOverride(customCmd, 8001)
+	wantCustom := []string{"python", "manage.py", "runserver", "0.0.0.0:8001"}
+	if !reflect.DeepEqual(gotCustom, wantCustom) {
+		t.Fatalf("expected %v, got %v", wantCustom, gotCustom)
+	}
+}

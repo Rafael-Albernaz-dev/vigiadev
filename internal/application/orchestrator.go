@@ -371,6 +371,7 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 	effectiveCmd := svc.Command
 	effectiveEnv := svc.Env
 	var assignedPort int
+	reuseOccupied := false
 
 	// Resolução e remapeamento de portas
 	if len(svc.Ports) > 0 {
@@ -415,7 +416,7 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 					Message: "porta já em uso e política configurada para 'fail'",
 				}
 			case domain.PortPolicyReuse:
-				// Adota porta existente
+				reuseOccupied = true
 			}
 		}
 	}
@@ -443,6 +444,19 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 			IntervalMs: 250,
 			Retries:    40,
 		}
+	}
+	if reuseOccupied {
+		if _, err := o.waitUntilHealthy(ctx, name, svc.HealthCheck); err != nil {
+			return fmt.Errorf("service %q cannot reuse occupied port %d: %w", name, assignedPort, err)
+		}
+		o.Bus.Publish(domain.ServiceStateChanged{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			OldState:  domain.StateStarting,
+			NewState:  domain.StateHealthy,
+			Detail:    fmt.Sprintf("reusing existing service on port %d", assignedPort),
+		})
+		return nil
 	}
 
 	// Se for um serviço gerenciado via Docker Compose, delega ao DockerManager

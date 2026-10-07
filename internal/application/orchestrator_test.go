@@ -831,3 +831,52 @@ func TestOrchestrator_PortPolicies(t *testing.T) {
 		})
 	}
 }
+
+func TestOrchestrator_ReuseOccupiedService(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	cfg := &domain.VigiaConfig{Version: 1, ProjectName: "reuse-test", Services: map[string]domain.ServiceConfig{
+		"web": {Command: []string{"executable-that-must-not-run"}, Ports: []int{port}, PortPolicy: domain.PortPolicyReuse},
+	}}
+	bus := domain.NewEventBus()
+	healthy := make(chan domain.ServiceStateChanged, 1)
+	bus.Subscribe(func(event domain.Event) {
+		if state, ok := event.(domain.ServiceStateChanged); ok && state.NewState == domain.StateHealthy {
+			healthy <- state
+		}
+	})
+	orch, err := application.NewOrchestrator(cfg, t.TempDir(), bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(orch.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- orch.Run(ctx) }()
+	select {
+	case state := <-healthy:
+		if !strings.Contains(state.Detail, "reusing existing service") {
+			t.Fatalf("unexpected reuse state: %+v", state)
+		}
+	case err := <-done:
+		t.Fatalf("reuse startup failed: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("reuse did not become healthy")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("orchestrator did not stop")
+	}
+	if ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("reused listener was stopped")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
@@ -112,20 +113,31 @@ func (sd *StackDetector) detectDockerCompose() (map[string]domain.ServiceConfig,
 
 	services := make(map[string]domain.ServiceConfig)
 	for name, svc := range composeDoc.Services {
-		var port int
-		lowerName := strings.ToLower(name) + " " + strings.ToLower(svc.Image)
+		var portsList []int
+		for _, rawPort := range svc.Ports {
+			if hp := parseComposeHostPort(rawPort); hp > 0 {
+				portsList = append(portsList, hp)
+			}
+		}
 
-		switch {
-		case strings.Contains(lowerName, "postgres") || strings.Contains(lowerName, "pgsql"):
-			port = 5432
-		case strings.Contains(lowerName, "redis"):
-			port = 6379
-		case strings.Contains(lowerName, "mysql") || strings.Contains(lowerName, "mariadb"):
-			port = 3306
-		case strings.Contains(lowerName, "mongo"):
-			port = 27017
-		case strings.Contains(lowerName, "rabbit"):
-			port = 5672
+		if len(portsList) == 0 {
+			var port int
+			lowerName := strings.ToLower(name) + " " + strings.ToLower(svc.Image)
+			switch {
+			case strings.Contains(lowerName, "postgres") || strings.Contains(lowerName, "pgsql"):
+				port = 5432
+			case strings.Contains(lowerName, "redis"):
+				port = 6379
+			case strings.Contains(lowerName, "mysql") || strings.Contains(lowerName, "mariadb"):
+				port = 3306
+			case strings.Contains(lowerName, "mongo"):
+				port = 27017
+			case strings.Contains(lowerName, "rabbit"):
+				port = 5672
+			}
+			if port > 0 {
+				portsList = []int{port}
+			}
 		}
 
 		serviceCfg := domain.ServiceConfig{
@@ -133,11 +145,11 @@ func (sd *StackDetector) detectDockerCompose() (map[string]domain.ServiceConfig,
 			PortPolicy:     domain.PortPolicyReuse,
 		}
 
-		if port > 0 {
-			serviceCfg.Ports = []int{port}
+		if len(portsList) > 0 {
+			serviceCfg.Ports = portsList
 			serviceCfg.HealthCheck = &domain.HealthCheckConfig{
 				Type: domain.HealthCheckTCP,
-				Port: port,
+				Port: portsList[0],
 			}
 		}
 
@@ -181,6 +193,9 @@ func (sd *StackDetector) detectNodeJS() (domain.ServiceConfig, string) {
 	} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
 		port = 3000
 	}
+	if explicit := scriptPort(pkg.Scripts[script]); explicit != 0 {
+		port = explicit
+	}
 
 	cmd := []string{pkgManager, "run", script}
 	if pkgManager == "npm" && script == "start" {
@@ -199,6 +214,62 @@ func (sd *StackDetector) detectNodeJS() (domain.ServiceConfig, string) {
 
 	return svc, fmt.Sprintf("Node.js (%s run %s)", pkgManager, script)
 }
+
+func scriptPort(script string) int {
+	args := strings.Fields(script)
+	for i, arg := range args {
+		value := ""
+		switch {
+		case (arg == "--port" || arg == "-p") && i+1 < len(args):
+			value = args[i+1]
+		case strings.HasPrefix(arg, "--port="):
+			value = strings.TrimPrefix(arg, "--port=")
+		}
+		if value != "" {
+			port, err := strconv.Atoi(value)
+			if err == nil && port > 0 && port <= 65535 {
+				return port
+			}
+		}
+	}
+	return 0
+}
+
+func parseComposeHostPort(raw interface{}) int {
+	switch v := raw.(type) {
+	case int:
+		if v > 0 && v <= 65535 {
+			return v
+		}
+	case string:
+		str := strings.TrimSpace(v)
+		parts := strings.Split(str, ":")
+		var hostPart string
+		switch len(parts) {
+		case 1:
+			hostPart = parts[0]
+		case 2:
+			hostPart = parts[0]
+		case 3:
+			hostPart = parts[1]
+		default:
+			return 0
+		}
+		if idx := strings.Index(hostPart, "-"); idx > 0 {
+			hostPart = hostPart[:idx]
+		}
+		p, err := strconv.Atoi(hostPart)
+		if err == nil && p > 0 && p <= 65535 {
+			return p
+		}
+	case map[string]interface{}:
+		if pub, ok := v["published"]; ok {
+			return parseComposeHostPort(pub)
+		}
+	}
+	return 0
+}
+
 
 // detectPython inspeciona manage.py (Django) ou FastAPI/uvicorn.
 func (sd *StackDetector) detectPython() (domain.ServiceConfig, string) {

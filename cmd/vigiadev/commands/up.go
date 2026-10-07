@@ -16,6 +16,7 @@ import (
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/detector"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
@@ -33,7 +34,7 @@ var (
 )
 
 var upCmd = &cobra.Command{
-	Use:   "up",
+	Use:   "up [services...]",
 	Short: "Start and supervise local environment services with interactive TUI",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
@@ -86,6 +87,15 @@ var upCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to load configuration: %w", err)
 		}
+		if len(args) > 0 {
+			cfg, err = FilterServices(cfg, args)
+			if err != nil {
+				return err
+			}
+		}
+		if err := ReapOrphanedProcesses(cwd, cfg.ProjectName); err != nil {
+			return err
+		}
 
 		input, isFile := cmd.InOrStdin().(*os.File)
 		interactive := isFile && isatty.IsTerminal(input.Fd()) && os.Getenv("CI") == ""
@@ -101,7 +111,7 @@ var upCmd = &cobra.Command{
 		}
 
 		defer orch.Close()
-		orch.AllowPortKill = forceUp || (killPorts && !interactive)
+		orch.AllowPortKill = killPorts && (forceUp || !interactive)
 		orch.InitialPortRemaps = remaps
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -198,46 +208,14 @@ func PreflightPorts(cfg *domain.VigiaConfig, in io.Reader, out io.Writer, intera
 	var remaps []domain.PortRemapped
 	for _, name := range names {
 		svc := cfg.Services[name]
+		if svc.PortPolicy == domain.PortPolicyReuse {
+			continue
+		}
 		for index, port := range svc.Ports {
 			if resolver.IsPortAvailable(port) {
 				continue
 			}
-			action := ""
-			explicitKill := kill || svc.PortPolicy == domain.PortPolicyKill
-			if explicitKill && (force || (kill && !interactive)) {
-				action = "y"
-			}
-			if !explicitKill && svc.PortPolicy == domain.PortPolicyRemap {
-				action = "remap"
-			}
-			var info *ports.ProcessInfo
-			var err error
-			if action != "remap" {
-				info, err = ports.FindProcessByPort(port)
-				if err != nil {
-					return nil, fmt.Errorf("port %d: %w", port, err)
-				}
-			}
-			if action == "" && interactive && !force {
-				if explicitKill {
-					fmt.Fprintf(out, "Port %d is in use by PID %d. Proceed to kill? [y/N]: ", port, info.PID)
-				} else {
-					fmt.Fprintf(out, "⚠️  Port %d is already in use by PID %d (%s).\nDo you want to kill this process to free the port? [y/N/remap]: ", port, info.PID, info.Name)
-				}
-				answer, err := reader.ReadString('\n')
-				if err == nil {
-					action = strings.ToLower(strings.TrimSpace(answer))
-				}
-			}
-			switch action {
-			case "y", "yes":
-				if err := ports.KillProcessOnPort(port, info, 500*time.Millisecond); err != nil {
-					return nil, err
-				}
-			case "r", "remap":
-				if explicitKill {
-					return nil, fmt.Errorf("Operation cancelled due to port conflict.")
-				}
+			if svc.PortPolicy == domain.PortPolicyRemap {
 				if svc.ComposeService != "" {
 					return nil, fmt.Errorf("cannot remap compose service %q without changing its published port mapping", name)
 				}
@@ -254,15 +232,133 @@ func PreflightPorts(cfg *domain.VigiaConfig, in io.Reader, out io.Writer, intera
 				reserved[assigned] = true
 				svc = ports.RemapService(svc, index, assigned)
 				remaps = append(remaps, domain.PortRemapped{BaseEvent: domain.NewBaseEvent(), Service: name, OriginalPort: port, TargetPort: assigned})
+				continue
+			}
+			if !kill {
+				_, err := ports.FindProcessByPort(port)
+				if errors.Is(err, ports.ErrProcessInaccessible) {
+					return nil, fmt.Errorf("port %d is occupied by an external system process; cannot bind", port)
+				}
+				return nil, fmt.Errorf("port %d is occupied; cannot bind service %q", port, name)
+			}
+			action := ""
+			if force || !interactive {
+				action = "y"
+			}
+			var info *ports.ProcessInfo
+			var err error
+			info, err = ports.FindProcessByPort(port)
+			if errors.Is(err, ports.ErrProcessInaccessible) {
+				return nil, fmt.Errorf("port %d is occupied by an external system process; cannot bind", port)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("port %d: %w", port, err)
+			}
+			if action == "" {
+				fmt.Fprintf(out, "Port %d is in use by PID %d (%s). Proceed to kill? [y/N]: ", port, info.PID, info.Name)
+				answer, err := reader.ReadString('\n')
+				if err == nil {
+					action = strings.ToLower(strings.TrimSpace(answer))
+				}
+			}
+			switch action {
+			case "y", "yes":
+				if err := ports.KillProcessOnPort(port, info, 500*time.Millisecond); err != nil {
+					return nil, err
+				}
 			default:
 				return nil, fmt.Errorf("Operation cancelled due to port conflict.")
 			}
 		}
-		// A later race must not reuse an unconfirmed replacement process.
-		if svc.PortPolicy != domain.PortPolicyRemap {
-			svc.PortPolicy = domain.PortPolicyFail
-		}
 		cfg.Services[name] = svc
 	}
 	return remaps, nil
+}
+
+// ReapOrphanedProcesses removes only local PIDs recorded by a stale run of this project.
+func ReapOrphanedProcesses(workDir, projectName string) error {
+	m, err := manifest.ReadManifest(workDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read prior run manifest: %w", err)
+	}
+	if m.ProjectName != projectName || m.RunID == "" {
+		return fmt.Errorf("prior run manifest does not match this project")
+	}
+	lock, err := os.ReadFile(filepath.Join(workDir, manifest.VigiaDir, manifest.LockFile))
+	if err == nil {
+		var owner int
+		if _, scanErr := fmt.Sscanf(string(lock), "%d", &owner); scanErr == nil && owner > 1 {
+			if err := syscall.Kill(owner, 0); err == nil || errors.Is(err, syscall.EPERM) {
+				return fmt.Errorf("prior vigiadev session with PID %d is still active", owner)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for name, svc := range m.Services {
+		if svc.IsContainer || svc.PID <= 1 || svc.PGID != svc.PID {
+			continue
+		}
+		cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", svc.PID))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect orphan %q: %w", name, err)
+		}
+		group, err := syscall.Getpgid(svc.PID)
+		if err != nil || group != svc.PGID || filepath.Clean(cwd) != filepath.Clean(workDir) {
+			return fmt.Errorf("refusing to terminate PID %d: project or process group no longer matches", svc.PID)
+		}
+		if err := ports.KillProcessByPID(svc.PID, 500*time.Millisecond); err != nil {
+			return fmt.Errorf("reap orphan %q: %w", name, err)
+		}
+	}
+	return manifest.RemoveManifest(workDir)
+}
+
+// FilterServices resolves the requested services and their transitive dependencies.
+func FilterServices(cfg *domain.VigiaConfig, targets []string) (*domain.VigiaConfig, error) {
+	if len(targets) == 0 {
+		return cfg, nil
+	}
+	selected := make(map[string]bool)
+	var queue []string
+
+	for _, target := range targets {
+		if _, exists := cfg.Services[target]; !exists {
+			var available []string
+			for k := range cfg.Services {
+				available = append(available, k)
+			}
+			sort.Strings(available)
+			return nil, fmt.Errorf("service %q not found. Available services: %s", target, strings.Join(available, ", "))
+		}
+		if !selected[target] {
+			selected[target] = true
+			queue = append(queue, target)
+		}
+	}
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		svc := cfg.Services[curr]
+		for _, dep := range svc.DependsOn {
+			if !selected[dep] {
+				selected[dep] = true
+				queue = append(queue, dep)
+			}
+		}
+	}
+
+	filtered := *cfg
+	filtered.Services = make(map[string]domain.ServiceConfig)
+	for name := range selected {
+		filtered.Services[name] = cfg.Services[name]
+	}
+	return &filtered, nil
 }

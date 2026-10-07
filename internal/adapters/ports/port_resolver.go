@@ -3,6 +3,7 @@ package ports
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -73,6 +74,60 @@ func InterpolateCommand(args []string, port int) []string {
 	return result
 }
 
+// ApplyPortOverride aplica o novo valor de porta a um comando de processo, seja por interpolação de {port},
+// por atualização de flags (--port, -p) ou injeção de override para gerenciadores JS (npm, pnpm, yarn, bun).
+func ApplyPortOverride(cmd []string, port int) []string {
+	if len(cmd) == 0 {
+		return cmd
+	}
+	hasPlaceholder := false
+	for _, arg := range cmd {
+		if strings.Contains(arg, "{port}") {
+			hasPlaceholder = true
+			break
+		}
+	}
+	if hasPlaceholder {
+		return InterpolateCommand(cmd, port)
+	}
+
+	updated := false
+	result := make([]string, len(cmd))
+	copy(result, cmd)
+	for i := 0; i < len(result); i++ {
+		if (result[i] == "--port" || result[i] == "-p") && i+1 < len(result) {
+			result[i+1] = strconv.Itoa(port)
+			updated = true
+			i++
+		} else if strings.HasPrefix(result[i], "--port=") {
+			result[i] = "--port=" + strconv.Itoa(port)
+			updated = true
+		}
+	}
+	if updated {
+		return result
+	}
+
+	portStr := strconv.Itoa(port)
+	tool := filepath.Base(result[0])
+	switch tool {
+	case "npm":
+		if len(result) >= 3 && result[1] == "run" {
+			return append(result, "--", "--port", portStr)
+		}
+	case "pnpm":
+		return append(result, "--port", portStr)
+	case "yarn":
+		return append(result, "--port", portStr)
+	case "bun":
+		if len(result) >= 3 && result[1] == "run" {
+			return append(result, "--port", portStr)
+		}
+	}
+
+	return result
+}
+
 // InterpolateEnv substitui {port} nos valores do mapa de variáveis de ambiente.
 func InterpolateEnv(env map[string]string, port int) map[string]string {
 	result := make(map[string]string, len(env))
@@ -87,8 +142,12 @@ func RemapService(svc domain.ServiceConfig, index, port int) domain.ServiceConfi
 	original := svc.Ports[index]
 	svc.Ports = append([]int(nil), svc.Ports...)
 	svc.Ports[index] = port
-	svc.Command = InterpolateCommand(svc.Command, port)
-	svc.Env = InterpolateEnv(svc.Env, port)
+	svc.Command = ApplyPortOverride(svc.Command, port)
+	if svc.Env == nil {
+		svc.Env = make(map[string]string)
+	} else {
+		svc.Env = InterpolateEnv(svc.Env, port)
+	}
 	svc.Env["PORT"] = strconv.Itoa(port)
 	if svc.HealthCheck != nil {
 		hc := *svc.HealthCheck
@@ -96,7 +155,7 @@ func RemapService(svc domain.ServiceConfig, index, port int) domain.ServiceConfi
 			hc.Port = port
 		}
 		hc.URL = InterpolatePort(hc.URL, port)
-		hc.Command = InterpolateCommand(hc.Command, port)
+		hc.Command = ApplyPortOverride(hc.Command, port)
 		svc.HealthCheck = &hc
 	}
 	return svc

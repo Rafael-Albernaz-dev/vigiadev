@@ -22,6 +22,10 @@ type ProcessInfo struct {
 	identity    string
 }
 
+// ErrProcessInaccessible means a TCP listener exists but its owner cannot be
+// established safely from procfs. Callers must never attempt to kill it.
+var ErrProcessInaccessible = errors.New("listener belongs to an inaccessible external system process")
+
 type tcpListener struct {
 	inode, network, address string
 	port                    int
@@ -94,11 +98,18 @@ func socketInodes(pid int) (map[string]bool, error) {
 		return nil, err
 	}
 	result := make(map[string]bool)
+	var permissionErr error
 	for _, entry := range entries {
 		link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, entry.Name()))
+		if errors.Is(err, os.ErrPermission) {
+			permissionErr = err
+		}
 		if err == nil && strings.HasPrefix(link, "socket:[") {
 			result[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
 		}
+	}
+	if permissionErr != nil {
+		return nil, permissionErr
 	}
 	return result, nil
 }
@@ -124,17 +135,28 @@ func FindProcessByPort(port int) (*ProcessInfo, error) {
 	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
+		}
 		return nil, err
 	}
+	return findProcessOwner(port, wanted, entries, socketInodes)
+}
+
+func findProcessOwner(port int, wanted map[string]bool, entries []os.DirEntry, scan func(int) (map[string]bool, error)) (*ProcessInfo, error) {
 	var found *ProcessInfo
 	matched := make(map[string]bool)
+	inaccessible := false
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		inodes, err := socketInodes(pid)
+		inodes, err := scan(pid)
 		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				inaccessible = true
+			}
 			continue
 		}
 		owns := false
@@ -152,20 +174,32 @@ func FindProcessByPort(port int) (*ProcessInfo, error) {
 		}
 		identity, _, err := processIdentity(pid)
 		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
+			}
 			return nil, err
 		}
 		name, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
 		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
+			}
 			return nil, err
 		}
 		command, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
 		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
+			}
 			return nil, err
 		}
 		found = &ProcessInfo{PID: pid, Name: strings.TrimSpace(string(name)), CommandLine: strings.TrimSpace(strings.ReplaceAll(string(command), "\x00", " ")), identity: identity}
 	}
 	if found == nil || len(matched) != len(wanted) {
-		return nil, fmt.Errorf("cannot identify all listener owners on port %d (permissions or process exited)", port)
+		if inaccessible {
+			return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
+		}
+		return nil, fmt.Errorf("port %d: %w (owner hidden or exited)", port, ErrProcessInaccessible)
 	}
 	return found, nil
 }

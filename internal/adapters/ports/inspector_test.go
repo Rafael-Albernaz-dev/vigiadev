@@ -1,19 +1,19 @@
-package ports_test
+package ports
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 )
 
 func TestInspectorListenerHelper(t *testing.T) {
@@ -73,7 +73,7 @@ func TestFindProcessByPort(t *testing.T) {
 	for _, network := range []string{"tcp4", "tcp6"} {
 		t.Run(network, func(t *testing.T) {
 			cmd, port := inspectorChild(t, false, network)
-			info, err := ports.FindProcessByPort(port)
+			info, err := FindProcessByPort(port)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -83,9 +83,29 @@ func TestFindProcessByPort(t *testing.T) {
 		})
 	}
 	for _, port := range []int{-1, 0, 65536} {
-		if _, err := ports.FindProcessByPort(port); err == nil {
+		if _, err := FindProcessByPort(port); err == nil {
 			t.Fatalf("invalid port %d accepted", port)
 		}
+	}
+}
+
+func TestFindProcessByPort_Permissions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "4242"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = findProcessOwner(5432, map[string]bool{"listener-inode": true}, entries, func(pid int) (map[string]bool, error) {
+		if pid != 4242 {
+			t.Fatalf("unexpected PID %d", pid)
+		}
+		return nil, os.ErrPermission
+	})
+	if !errors.Is(err, ErrProcessInaccessible) {
+		t.Fatalf("expected inaccessible listener error, got %v", err)
 	}
 }
 
@@ -94,25 +114,25 @@ func TestKillProcessByPID(t *testing.T) {
 		t.Run(fmt.Sprint("ignore-term=", ignore), func(t *testing.T) {
 			cmd, port := inspectorChild(t, ignore, "tcp4")
 			start := time.Now()
-			if err := ports.KillProcessByPID(cmd.Process.Pid, 100*time.Millisecond); err != nil {
+			if err := KillProcessByPID(cmd.Process.Pid, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
 			}
 			if ignore && time.Since(start) < 100*time.Millisecond {
 				t.Fatal("SIGTERM grace period was not honored")
 			}
-			if !ports.NewPortResolver("").IsPortAvailable(port) {
+			if !NewPortResolver("").IsPortAvailable(port) {
 				t.Fatal("port still occupied")
 			}
 			if err := cmd.Wait(); err == nil {
 				t.Fatal("expected child to terminate by signal")
 			}
-			if err := ports.KillProcessByPID(cmd.Process.Pid, time.Millisecond); err != nil {
+			if err := KillProcessByPID(cmd.Process.Pid, time.Millisecond); err != nil {
 				t.Fatalf("not idempotent: %v", err)
 			}
 		})
 	}
 	for _, pid := range []int{-1, 0, 1, os.Getpid()} {
-		if err := ports.KillProcessByPID(pid, time.Millisecond); err == nil {
+		if err := KillProcessByPID(pid, time.Millisecond); err == nil {
 			t.Fatalf("unsafe PID %d accepted", pid)
 		}
 	}
@@ -120,11 +140,11 @@ func TestKillProcessByPID(t *testing.T) {
 
 func TestKillProcessOnPortRejectsChangedOwner(t *testing.T) {
 	cmd, port := inspectorChild(t, false, "tcp4")
-	wrong := &ports.ProcessInfo{PID: cmd.Process.Pid + 1}
-	if err := ports.KillProcessOnPort(port, wrong, time.Millisecond); err == nil {
+	wrong := &ProcessInfo{PID: cmd.Process.Pid + 1}
+	if err := KillProcessOnPort(port, wrong, time.Millisecond); err == nil {
 		t.Fatal("unconfirmed owner killed")
 	}
-	if ports.NewPortResolver("").IsPortAvailable(port) {
+	if NewPortResolver("").IsPortAvailable(port) {
 		t.Fatal("listener lost after refused kill")
 	}
 }

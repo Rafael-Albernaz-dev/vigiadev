@@ -170,6 +170,9 @@ func cleanupResidualPorts(cwd, explicit string, force bool, reader *bufio.Reader
 			continue
 		}
 		for _, svc := range cfg.Services {
+			if svc.ComposeService != "" {
+				continue
+			}
 			for _, p := range svc.Ports {
 				if !seenPorts[p] {
 					seenPorts[p] = true
@@ -185,17 +188,18 @@ func cleanupResidualPorts(cwd, explicit string, force bool, reader *bufio.Reader
 		}
 		info, err := ports.FindProcessByPort(port)
 		if err != nil {
-			return fmt.Errorf("cannot inspect residual port %d: %w", port, err)
+			fmt.Fprintf(out, "ℹ️  Port %d occupied by external/system process; skipping residual cleanup.\n", port)
+			continue
 		}
 		confirmed := force
 		if !force {
-			fmt.Fprintf(out, "⚠️  Port %d is still occupied by residual process PID %d. Kill it? [y/N]: ", port, info.PID)
+			fmt.Fprintf(out, "⚠️  Port %d is still occupied by residual process PID %d (%s). Kill it? [y/N]: ", port, info.PID, info.Name)
 			answer, err := reader.ReadString('\n')
 			confirmed = err == nil && (strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"))
 		}
 		if confirmed {
 			if err := ports.KillProcessOnPort(port, info, 500*time.Millisecond); err != nil {
-				return err
+				fmt.Fprintf(out, "⚠️  Could not terminate process on port %d: %v\n", port, err)
 			}
 		}
 	}

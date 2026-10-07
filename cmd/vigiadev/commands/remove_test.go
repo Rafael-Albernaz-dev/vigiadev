@@ -160,3 +160,21 @@ func TestRemove_ResidualPortCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestRemove_ReuseAndComposePortsPreserved(t *testing.T) {
+	child, port := conflictChild(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "vigiadev.yaml")
+	data := fmt.Sprintf("version: 1\nproject_name: reuse-remove\nservices:\n  db:\n    compose_service: postgres\n    port_policy: reuse\n    ports: [%d]\n", port)
+	if err := os.WriteFile(file, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commands.RunRemove(dir, true, false, "", strings.NewReader("")); err != nil {
+		t.Fatalf("remove failed on reuse port: %v", err)
+	}
+	if ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("reuse listener was terminated by remove")
+	}
+	_ = child.Process.Kill()
+	_ = child.Wait()
+}

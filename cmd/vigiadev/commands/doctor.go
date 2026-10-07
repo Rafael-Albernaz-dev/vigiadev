@@ -27,7 +27,11 @@ func findPortConflicts(cfg *domain.VigiaConfig) []portConflict {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		for _, port := range cfg.Services[name].Ports {
+		svc := cfg.Services[name]
+		if svc.PortPolicy == domain.PortPolicyReuse {
+			continue
+		}
+		for _, port := range svc.Ports {
 			listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 			if err != nil {
 				conflicts = append(conflicts, portConflict{Service: name, Port: port})
@@ -83,8 +87,27 @@ var doctorCmd = &cobra.Command{
 				return err
 			}
 			conflicts := findPortConflicts(cfg)
+			names := make([]string, 0, len(cfg.Services))
+			for name := range cfg.Services {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				svc := cfg.Services[name]
+				if svc.PortPolicy != domain.PortPolicyReuse {
+					continue
+				}
+				for _, port := range svc.Ports {
+					listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+					if err != nil {
+						fmt.Fprintf(out, "✅ Port %d for service '%s': active and available for reuse\n", port, name)
+					} else {
+						_ = listener.Close()
+					}
+				}
+			}
 			if len(conflicts) == 0 {
-				fmt.Fprintln(out, "✅ Configured host ports: available")
+				fmt.Fprintln(out, "✅ Configured host ports: no conflicts requiring action")
 			} else {
 				for _, conflict := range conflicts {
 					fmt.Fprintf(out, "⚠️ Port conflict: service '%s' declares TCP port %d, already occupied on 127.0.0.1\n", conflict.Service, conflict.Port)
