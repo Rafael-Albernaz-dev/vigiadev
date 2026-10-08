@@ -39,6 +39,7 @@ type HealthCheckConfig struct {
 
 // ServiceConfig representa a declaração de um serviço no vigiaDev.
 type ServiceConfig struct {
+	Dir            string             `yaml:"dir,omitempty"`
 	Command        []string           `yaml:"command,omitempty"`
 	Ports          []int              `yaml:"ports,omitempty"`
 	PortPolicy     PortPolicy         `yaml:"port_policy,omitempty"`
@@ -56,6 +57,7 @@ type ServiceConfig struct {
 
 // TaskConfig representa uma tarefa one-off no DAG (ex: migrations, seeds).
 type TaskConfig struct {
+	Dir       string            `yaml:"dir,omitempty"`
 	Command   []string          `yaml:"command"`
 	DependsOn []string          `yaml:"depends_on,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty"`

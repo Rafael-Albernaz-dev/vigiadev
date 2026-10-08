@@ -266,6 +266,23 @@ func PreflightPorts(cfg *domain.VigiaConfig, in io.Reader, out io.Writer, intera
 				if err := ports.KillProcessOnPort(port, info, 500*time.Millisecond); err != nil {
 					return nil, err
 				}
+			case "r", "remap":
+				if svc.ComposeService != "" {
+					return nil, fmt.Errorf("cannot remap compose service %q without changing its published port mapping", name)
+				}
+				assigned := 0
+				for candidate := port + 1; candidate <= 65535 && candidate <= port+ports.MaxScanAttempts; candidate++ {
+					if !reserved[candidate] && resolver.IsPortAvailable(candidate) {
+						assigned = candidate
+						break
+					}
+				}
+				if assigned == 0 {
+					return nil, fmt.Errorf("no available port within %d attempts after %d", ports.MaxScanAttempts, port)
+				}
+				reserved[assigned] = true
+				svc = ports.RemapService(svc, index, assigned)
+				remaps = append(remaps, domain.PortRemapped{BaseEvent: domain.NewBaseEvent(), Service: name, OriginalPort: port, TargetPort: assigned})
 			default:
 				return nil, fmt.Errorf("Operation cancelled due to port conflict.")
 			}

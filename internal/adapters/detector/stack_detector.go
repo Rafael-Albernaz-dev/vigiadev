@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -47,6 +48,7 @@ func (sd *StackDetector) Detect() (*DetectionResult, error) {
 	}
 
 	var markers []string
+	usedPorts := make(map[int]bool)
 
 	// 1. Heurística Docker Compose
 	composeServices, composeMarker := sd.detectDockerCompose()
@@ -54,23 +56,30 @@ func (sd *StackDetector) Detect() (*DetectionResult, error) {
 		markers = append(markers, composeMarker)
 		for name, svc := range composeServices {
 			cfg.Services[name] = svc
+			for _, p := range svc.Ports {
+				usedPorts[p] = true
+			}
 		}
 	}
 
-	// 2. Heurística Node.js
-	nodeSvc, nodeMarker := sd.detectNodeJS()
-	if nodeMarker != "" {
-		markers = append(markers, nodeMarker)
-		cfg.Services["frontend"] = nodeSvc
+	// 2. Heurística Node.js (Workspaces, Monorepos e Single Projects)
+	nodeResult := sd.detectNodeServices(usedPorts)
+	for name, svc := range nodeResult.services {
+		cfg.Services[name] = svc
 	}
+	markers = append(markers, nodeResult.markers...)
 
 	// 3. Heurística Python
 	pythonSvc, pythonMarker := sd.detectPython()
 	if pythonMarker != "" {
 		markers = append(markers, pythonMarker)
 		svcName := "backend"
-		if _, exists := cfg.Services["frontend"]; !exists {
+		if len(cfg.Services) == 0 {
 			svcName = "app"
+		} else if _, exists := cfg.Services["frontend"]; !exists {
+			if _, existsApp := cfg.Services["app"]; !existsApp && len(cfg.Services) == len(composeServices) {
+				svcName = "app"
+			}
 		}
 		cfg.Services[svcName] = pythonSvc
 	}
@@ -159,60 +168,230 @@ func (sd *StackDetector) detectDockerCompose() (map[string]domain.ServiceConfig,
 	return services, fmt.Sprintf("Docker Compose (%s)", filepath.Base(foundPath))
 }
 
-// detectNodeJS inspeciona package.json e lockfiles.
-func (sd *StackDetector) detectNodeJS() (domain.ServiceConfig, string) {
-	pkgPath := filepath.Join(sd.RootDir, "package.json")
-	data, err := os.ReadFile(pkgPath)
-	if err != nil {
-		return domain.ServiceConfig{}, ""
+type nodeDetection struct {
+	services map[string]domain.ServiceConfig
+	markers  []string
+}
+
+func (sd *StackDetector) detectNodeServices(usedPorts map[int]bool) nodeDetection {
+	result := nodeDetection{
+		services: make(map[string]domain.ServiceConfig),
 	}
 
-	var pkg struct {
-		Scripts      map[string]string `json:"scripts"`
-		Dependencies map[string]string `json:"dependencies"`
-		DevDeps      map[string]string `json:"devDependencies"`
+	allocPort := func(preferred int) int {
+		p := preferred
+		for usedPorts[p] {
+			p++
+		}
+		usedPorts[p] = true
+		return p
 	}
-	_ = json.Unmarshal(data, &pkg)
 
-	// Detecta gerenciador de pacotes por lockfile
-	pkgManager := sd.packageManager()
+	// 1. Inspeciona package.json raiz
+	rootPkgPath := filepath.Join(sd.RootDir, "package.json")
+	if data, err := os.ReadFile(rootPkgPath); err == nil {
+		var pkg struct {
+			Scripts      map[string]string `json:"scripts"`
+			Dependencies map[string]string `json:"dependencies"`
+			DevDeps      map[string]string `json:"devDependencies"`
+		}
+		_ = json.Unmarshal(data, &pkg)
 
-	// Identifica script de inicialização
-	script := "dev"
-	if _, ok := pkg.Scripts["dev"]; !ok {
-		if _, ok := pkg.Scripts["start"]; ok {
-			script = "start"
+		pm := sd.packageManager()
+
+		// Procura por scripts modulares do tipo dev:<module>
+		var modularDevs []string
+		for scriptName := range pkg.Scripts {
+			if strings.HasPrefix(scriptName, "dev:") {
+				modularDevs = append(modularDevs, scriptName)
+			}
+		}
+		sort.Strings(modularDevs)
+
+		if len(modularDevs) > 0 {
+			for _, scriptName := range modularDevs {
+				svcName := strings.TrimPrefix(scriptName, "dev:")
+				cmd := []string{pm, "run", scriptName}
+				scriptBody := pkg.Scripts[scriptName]
+				port := scriptPort(scriptBody)
+				if port == 0 {
+					lower := strings.ToLower(svcName)
+					pref := 3000
+					if strings.Contains(lower, "front") || strings.Contains(lower, "web") || strings.Contains(lower, "ui") {
+						pref = 5173
+					} else if strings.Contains(lower, "api") || strings.Contains(lower, "back") || strings.Contains(lower, "server") {
+						pref = 3000
+					}
+					port = allocPort(pref)
+				} else {
+					usedPorts[port] = true
+				}
+
+				svc := domain.ServiceConfig{
+					Command:    cmd,
+					Ports:      []int{port},
+					PortPolicy: domain.PortPolicyRemap,
+					HealthCheck: &domain.HealthCheckConfig{
+						Type: domain.HealthCheckTCP,
+						Port: port,
+					},
+				}
+				result.services[svcName] = svc
+				result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s run %s)", svcName, pm, scriptName))
+			}
+		} else {
+			// Busca script dev ou start padrão na raiz
+			script := "dev"
+			if _, ok := pkg.Scripts["dev"]; !ok {
+				if _, ok := pkg.Scripts["start"]; ok {
+					script = "start"
+				}
+			}
+
+			if _, hasScript := pkg.Scripts[script]; hasScript {
+				depsStr := fmt.Sprintf("%v %v", pkg.Dependencies, pkg.DevDeps)
+				svcName := "frontend"
+				prefPort := 3000
+				if strings.Contains(depsStr, "vite") {
+					svcName = "frontend"
+					prefPort = 5173
+				} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
+					svcName = "frontend"
+					prefPort = 3000
+				} else if strings.Contains(depsStr, "nest") || strings.Contains(depsStr, "express") || strings.Contains(depsStr, "fastify") || strings.Contains(depsStr, "koa") {
+					svcName = "backend"
+					prefPort = 3000
+				}
+
+				port := scriptPort(pkg.Scripts[script])
+				if port == 0 {
+					port = allocPort(prefPort)
+				} else {
+					usedPorts[port] = true
+				}
+
+				cmd := []string{pm, "run", script}
+				if pm == "npm" && script == "start" {
+					cmd = []string{"npm", "start"}
+				}
+
+				svc := domain.ServiceConfig{
+					Command:    cmd,
+					Ports:      []int{port},
+					PortPolicy: domain.PortPolicyRemap,
+					HealthCheck: &domain.HealthCheckConfig{
+						Type: domain.HealthCheckTCP,
+						Port: port,
+					},
+				}
+				result.services[svcName] = svc
+				result.markers = append(result.markers, fmt.Sprintf("Node.js (%s run %s)", pm, script))
+			}
 		}
 	}
 
-	// Infere porta padrão baseada em framework
-	port := 3000
-	depsStr := fmt.Sprintf("%v %v", pkg.Dependencies, pkg.DevDeps)
-	if strings.Contains(depsStr, "vite") {
-		port = 5173
-	} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
-		port = 3000
-	}
-	if explicit := scriptPort(pkg.Scripts[script]); explicit != 0 {
-		port = explicit
+	// 2. Inspeciona subdiretórios modulares (monorepos) se não cobertos
+	candidateDirs := []string{
+		"backend", "frontend", "api", "web", "server", "client",
 	}
 
-	cmd := []string{pkgManager, "run", script}
-	if pkgManager == "npm" && script == "start" {
-		cmd = []string{"npm", "start"}
+	for _, parent := range []string{"apps", "services", "packages"} {
+		entries, err := os.ReadDir(filepath.Join(sd.RootDir, parent))
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					candidateDirs = append(candidateDirs, filepath.Join(parent, e.Name()))
+				}
+			}
+		}
 	}
 
-	svc := domain.ServiceConfig{
-		Command:    cmd,
-		Ports:      []int{port},
-		PortPolicy: domain.PortPolicyRemap,
-		HealthCheck: &domain.HealthCheckConfig{
-			Type: domain.HealthCheckTCP,
-			Port: port,
-		},
+	for _, relDir := range candidateDirs {
+		svcName := filepath.Base(relDir)
+		if _, exists := result.services[svcName]; exists {
+			continue
+		}
+		subPkgPath := filepath.Join(sd.RootDir, relDir, "package.json")
+		data, err := os.ReadFile(subPkgPath)
+		if err != nil {
+			continue
+		}
+		var subPkg struct {
+			Scripts      map[string]string `json:"scripts"`
+			Dependencies map[string]string `json:"dependencies"`
+			DevDeps      map[string]string `json:"devDependencies"`
+		}
+		if err := json.Unmarshal(data, &subPkg); err != nil {
+			continue
+		}
+
+		script := "dev"
+		if _, ok := subPkg.Scripts["dev"]; !ok {
+			if _, ok := subPkg.Scripts["start"]; ok {
+				script = "start"
+			} else {
+				continue
+			}
+		}
+
+		subPm := detectPackageManager(filepath.Join(sd.RootDir, relDir))
+		depsStr := fmt.Sprintf("%v %v", subPkg.Dependencies, subPkg.DevDeps)
+		prefPort := 3000
+		if strings.Contains(depsStr, "vite") {
+			prefPort = 5173
+		} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
+			prefPort = 3000
+		} else if strings.Contains(svcName, "front") || strings.Contains(svcName, "web") {
+			prefPort = 5173
+		}
+
+		port := scriptPort(subPkg.Scripts[script])
+		if port == 0 {
+			port = allocPort(prefPort)
+		} else {
+			usedPorts[port] = true
+		}
+
+		cmd := []string{subPm, "run", script}
+		if subPm == "npm" && script == "start" {
+			cmd = []string{"npm", "start"}
+		}
+
+		svc := domain.ServiceConfig{
+			Dir:        relDir,
+			Command:    cmd,
+			Ports:      []int{port},
+			PortPolicy: domain.PortPolicyRemap,
+			HealthCheck: &domain.HealthCheckConfig{
+				Type: domain.HealthCheckTCP,
+				Port: port,
+			},
+		}
+		result.services[svcName] = svc
+		result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s run %s)", relDir, subPm, script))
 	}
 
-	return svc, fmt.Sprintf("Node.js (%s run %s)", pkgManager, script)
+	return result
+}
+
+// detectNodeJS inspeciona package.json e lockfiles.
+func (sd *StackDetector) detectNodeJS() (domain.ServiceConfig, string) {
+	res := sd.detectNodeServices(make(map[int]bool))
+	if svc, ok := res.services["frontend"]; ok {
+		marker := ""
+		if len(res.markers) > 0 {
+			marker = res.markers[0]
+		}
+		return svc, marker
+	}
+	for _, svc := range res.services {
+		marker := ""
+		if len(res.markers) > 0 {
+			marker = res.markers[0]
+		}
+		return svc, marker
+	}
+	return domain.ServiceConfig{}, ""
 }
 
 func scriptPort(script string) int {
@@ -335,17 +514,21 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// packageManager uses a fixed precedence when multiple lockfiles are present.
-func (sd *StackDetector) packageManager() string {
+func detectPackageManager(dir string) string {
 	for _, candidate := range []struct{ file, manager string }{
 		{"pnpm-lock.yaml", "pnpm"}, {"yarn.lock", "yarn"},
 		{"bun.lockb", "bun"}, {"bun.lock", "bun"}, {"package-lock.json", "npm"},
 	} {
-		if fileExists(filepath.Join(sd.RootDir, candidate.file)) {
+		if fileExists(filepath.Join(dir, candidate.file)) {
 			return candidate.manager
 		}
 	}
 	return "npm"
+}
+
+// packageManager uses a fixed precedence when multiple lockfiles are present.
+func (sd *StackDetector) packageManager() string {
+	return detectPackageManager(sd.RootDir)
 }
 
 // DetectTasks reads repository metadata only; it never executes discovered commands.

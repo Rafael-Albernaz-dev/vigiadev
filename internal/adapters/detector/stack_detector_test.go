@@ -326,3 +326,117 @@ services:
 		t.Fatalf("expected host port 8080 for gateway, got %v", svcs["gateway"].Ports)
 	}
 }
+
+func TestDetect_Monorepo_ModularScripts(t *testing.T) {
+	dir := t.TempDir()
+	pkgJSON := `{
+  "name": "@myorg/workspace",
+  "scripts": {
+    "dev:backend": "node server.js",
+    "dev:frontend": "vite --port 5173",
+    "dev:platform": "vite --port 5174",
+    "dev:erp": "node erp.js"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+	if len(svcs) != 4 {
+		t.Fatalf("expected 4 modular services detected, got %d: %+v", len(svcs), svcs)
+	}
+
+	backend, ok := svcs["backend"]
+	if !ok || backend.Command[2] != "dev:backend" {
+		t.Fatalf("expected backend service running dev:backend, got %+v", backend)
+	}
+
+	frontend, ok := svcs["frontend"]
+	if !ok || len(frontend.Ports) == 0 || frontend.Ports[0] != 5173 {
+		t.Fatalf("expected frontend service on port 5173, got %+v", frontend)
+	}
+
+	platform, ok := svcs["platform"]
+	if !ok || len(platform.Ports) == 0 || platform.Ports[0] != 5174 {
+		t.Fatalf("expected platform service on port 5174, got %+v", platform)
+	}
+
+	erp, ok := svcs["erp"]
+	if !ok || erp.Command[2] != "dev:erp" {
+		t.Fatalf("expected erp service, got %+v", erp)
+	}
+}
+
+func TestDetect_Monorepo_Subdirectories(t *testing.T) {
+	dir := t.TempDir()
+
+	// Backend subfolder
+	backendDir := filepath.Join(dir, "backend")
+	if err := os.MkdirAll(backendDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	backendPkg := `{"name":"my-backend","scripts":{"dev":"nest start"},"dependencies":{"@nestjs/core":"^10"}}`
+	if err := os.WriteFile(filepath.Join(backendDir, "package.json"), []byte(backendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Frontend subfolder
+	frontendDir := filepath.Join(dir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	frontendPkg := `{"name":"my-frontend","scripts":{"dev":"vite"},"dependencies":{"vite":"^5"}}`
+	if err := os.WriteFile(filepath.Join(frontendDir, "package.json"), []byte(frontendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+	if len(svcs) != 2 {
+		t.Fatalf("expected 2 subfolder services, got %d: %+v", len(svcs), svcs)
+	}
+
+	back, ok := svcs["backend"]
+	if !ok || back.Dir != "backend" {
+		t.Fatalf("expected backend service with dir 'backend', got %+v", back)
+	}
+
+	front, ok := svcs["frontend"]
+	if !ok || front.Dir != "frontend" || front.Ports[0] != 5173 {
+		t.Fatalf("expected frontend service with dir 'frontend' and port 5173, got %+v", front)
+	}
+}
+
+func TestDetect_NodeJS_BackendOnly(t *testing.T) {
+	dir := t.TempDir()
+	pkgJSON := `{
+  "name": "my-api",
+  "scripts": {"dev": "node server.js"},
+  "dependencies": {"express": "^4.18"}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := result.Config.Services["frontend"]; ok {
+		t.Fatalf("express API should not be detected as 'frontend'")
+	}
+	if _, ok := result.Config.Services["backend"]; !ok {
+		t.Fatalf("expected express API to be detected as 'backend'")
+	}
+}

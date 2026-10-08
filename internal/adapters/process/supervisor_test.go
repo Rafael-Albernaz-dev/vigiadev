@@ -100,3 +100,27 @@ func TestSupervisor_ProcessGroupTeardown(t *testing.T) {
 		t.Fatalf("esperava PGID positivo, obteve %d", info.PGID)
 	}
 }
+
+func TestSupervisor_DiagnoseExit_PortConflict(t *testing.T) {
+	bus := domain.NewEventBus()
+	sup := process.NewSupervisor(bus)
+
+	cmd := []string{"sh", "-c", "echo 'Error: listen EADDRINUSE: address already in use :::3000' >&2; exit 1"}
+	_, err := sup.StartProcess("crasher", cmd, nil, "")
+	if err != nil {
+		t.Fatalf("erro ao iniciar: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	exited, isPortConflict, detail := sup.DiagnoseExit("crasher")
+	if !exited {
+		t.Fatalf("expected process to have exited")
+	}
+	if !isPortConflict {
+		t.Fatalf("expected port conflict to be detected")
+	}
+	if detail == "" {
+		t.Fatalf("expected non-empty detail")
+	}
+}

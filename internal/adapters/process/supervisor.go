@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,14 +16,16 @@ import (
 
 // ManagedProcess armazena o estado de baixo nível do processo no SO.
 type ManagedProcess struct {
-	Name      string
-	Cmd       *exec.Cmd
-	PID       int
-	PGID      int
-	StartTime time.Time
-	Done      chan struct{}
-	ExitCode  int
-	ExitErr   error
+	Name       string
+	Cmd        *exec.Cmd
+	PID        int
+	PGID       int
+	StartTime  time.Time
+	Done       chan struct{}
+	ExitCode   int
+	ExitErr    error
+	recentLogs []string
+	logMu      sync.Mutex
 }
 
 // Supervisor gerencia o ciclo de vida dos processos POSIX com isolamento de grupos (PGID).
@@ -165,6 +168,7 @@ func (s *Supervisor) streamPipe(service string, r io.Reader, isError bool) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
+		s.recordLog(service, line)
 		if s.publisher != nil {
 			s.publisher.Publish(domain.LogLineProduced{
 				BaseEvent: domain.NewBaseEvent(),
@@ -174,6 +178,81 @@ func (s *Supervisor) streamPipe(service string, r io.Reader, isError bool) {
 			})
 		}
 	}
+}
+
+func (s *Supervisor) recordLog(service string, line string) {
+	s.mu.Lock()
+	proc, exists := s.processes[service]
+	s.mu.Unlock()
+	if !exists {
+		return
+	}
+	proc.logMu.Lock()
+	defer proc.logMu.Unlock()
+	proc.recentLogs = append(proc.recentLogs, line)
+	if len(proc.recentLogs) > 30 {
+		proc.recentLogs = proc.recentLogs[len(proc.recentLogs)-30:]
+	}
+}
+
+// ProcessStatus retorna se o processo está em execução, código de saída e últimas linhas de log.
+func (s *Supervisor) ProcessStatus(name string) (isRunning bool, exitCode int, recentLogs []string) {
+	s.mu.Lock()
+	proc, exists := s.processes[name]
+	s.mu.Unlock()
+	if !exists {
+		return false, 0, nil
+	}
+	proc.logMu.Lock()
+	defer proc.logMu.Unlock()
+	select {
+	case <-proc.Done:
+		return false, proc.ExitCode, append([]string(nil), proc.recentLogs...)
+	default:
+		return true, 0, append([]string(nil), proc.recentLogs...)
+	}
+}
+
+// DiagnoseExit verifica se o processo encerrou prematuramente e identifica causas prováveis (ex: colisão de porta).
+func (s *Supervisor) DiagnoseExit(name string) (exited bool, isPortConflict bool, detail string) {
+	s.mu.Lock()
+	_, exists := s.processes[name]
+	s.mu.Unlock()
+	if !exists {
+		return false, false, ""
+	}
+
+	isRunning, exitCode, logs := s.ProcessStatus(name)
+	if isRunning {
+		return false, false, ""
+	}
+
+	for i := len(logs) - 1; i >= 0; i-- {
+		line := logs[i]
+		lower := strings.ToLower(line)
+		if strings.Contains(line, "EADDRINUSE") ||
+			strings.Contains(lower, "address already in use") ||
+			strings.Contains(lower, "bind: address already in use") ||
+			strings.Contains(lower, "port is already in use") ||
+			strings.Contains(lower, "port is in use") ||
+			strings.Contains(lower, "port already in use") {
+			return true, true, fmt.Sprintf("port collision detected: %s", strings.TrimSpace(line))
+		}
+	}
+
+	lastErr := ""
+	for i := len(logs) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(logs[i])
+		if trimmed != "" {
+			lastErr = trimmed
+			break
+		}
+	}
+
+	if lastErr != "" {
+		return true, false, fmt.Sprintf("exited with code %d: %s", exitCode, lastErr)
+	}
+	return true, false, fmt.Sprintf("exited with code %d", exitCode)
 }
 
 // StopProcess encerra graciosamente todo o grupo de processos com SIGTERM e fallback para SIGKILL.

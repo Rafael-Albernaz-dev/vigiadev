@@ -59,6 +59,7 @@ type rawConfig struct {
 }
 
 type rawTaskConfig struct {
+	Dir       string            `yaml:"dir,omitempty"`
 	Command   interface{}       `yaml:"command"`
 	DependsOn []string          `yaml:"depends_on,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty"`
@@ -98,6 +99,7 @@ func LoadConfig(filePath string) (*domain.VigiaConfig, error) {
 		}
 
 		cfg.Tasks[name] = domain.TaskConfig{
+			Dir:       rt.Dir,
 			Command:   cmdParts,
 			DependsOn: rt.DependsOn,
 			Env:       rt.Env,

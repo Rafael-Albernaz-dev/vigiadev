@@ -880,3 +880,85 @@ func TestOrchestrator_ReuseOccupiedService(t *testing.T) {
 		t.Fatal("reused listener was stopped")
 	}
 }
+
+func TestOrchestrator_FailFast_PortConflictCrash(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "failfast-test",
+		Services: map[string]domain.ServiceConfig{
+			"crashing-api": {
+				Command: []string{"sh", "-c", "echo 'Error: listen EADDRINUSE :::3000' >&2; exit 1"},
+				Ports:   []int{3000},
+				HealthCheck: &domain.HealthCheckConfig{
+					Type: domain.HealthCheckTCP,
+					Port: 3000,
+				},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orch.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = orch.Run(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected orchestrator to fail fast when service crashes")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("orchestrator took too long to fail: %v (expected fail-fast < 1s)", elapsed)
+	}
+	if !strings.Contains(err.Error(), "port conflict") && !strings.Contains(err.Error(), "EADDRINUSE") {
+		t.Fatalf("expected port conflict diagnosis in error, got: %v", err)
+	}
+}
+
+func TestOrchestrator_ServiceAndTaskDir(t *testing.T) {
+	tempDir := t.TempDir()
+	subDir := filepath.Join(tempDir, "subproject")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "dir-test",
+		Tasks: map[string]domain.TaskConfig{
+			"check-dir": {
+				Dir:     "subproject",
+				Command: []string{"sh", "-c", "pwd > output.txt"},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orch.Close()
+
+	code, err := orch.RunTask(context.Background(), "check-dir", nil, true)
+	if err != nil || code != 0 {
+		t.Fatalf("task failed: code=%d err=%v", code, err)
+	}
+
+	outFile := filepath.Join(subDir, "output.txt")
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("expected output.txt to be created in subproject: %v", err)
+	}
+	if !strings.Contains(string(data), "subproject") {
+		t.Fatalf("expected pwd to contain 'subproject', got: %s", string(data))
+	}
+}

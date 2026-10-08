@@ -242,6 +242,30 @@ func (o *Orchestrator) waitUntilHealthy(ctx context.Context, service string, cfg
 	}
 	var lastErr error
 	for attempt := 0; attempt < retries; attempt++ {
+		if o.Supervisor != nil {
+			if exited, isPortConflict, diag := o.Supervisor.DiagnoseExit(service); exited {
+				msg := fmt.Sprintf("[vigiadev] ERROR: Service '%s' terminated prematurely: %s", service, diag)
+				o.Bus.Publish(domain.LogLineProduced{
+					BaseEvent: domain.NewBaseEvent(),
+					Service:   service,
+					Line:      msg,
+					IsError:   true,
+				})
+				if isPortConflict {
+					return 0, fmt.Errorf("service '%s' failed on startup due to port conflict: %s", service, diag)
+				}
+				return 0, fmt.Errorf("service '%s' failed on startup: %s", service, diag)
+			}
+		}
+		if o.Docker != nil {
+			if svc, ok := o.Config.Services[service]; ok && svc.ComposeService != "" {
+				info, err := o.Docker.FindContainer(ctx, service, o.WorkDir)
+				if err == nil && info != nil && (info.State == "exited" || info.State == "dead") {
+					return 0, fmt.Errorf("compose service '%s' exited unexpectedly (status: %s)", service, info.State)
+				}
+			}
+		}
+
 		start := time.Now()
 		err := o.Health.CheckSingle(ctx, cfg, "127.0.0.1")
 		latency := time.Since(start)
@@ -466,8 +490,17 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 
 	spawnTime := time.Now()
 
+	workDir := o.WorkDir
+	if svc.Dir != "" {
+		if filepath.IsAbs(svc.Dir) {
+			workDir = svc.Dir
+		} else {
+			workDir = filepath.Join(o.WorkDir, svc.Dir)
+		}
+	}
+
 	// Inicia o processo no supervisor POSIX
-	info, err := o.Supervisor.StartProcess(name, effectiveCmd, effectiveEnv, o.WorkDir)
+	info, err := o.Supervisor.StartProcess(name, effectiveCmd, effectiveEnv, workDir)
 	if err != nil {
 		return err
 	}
@@ -841,7 +874,15 @@ func (o *Orchestrator) RunTask(ctx context.Context, taskName string, extraArgs [
 	}
 
 	execCmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
-	execCmd.Dir = o.WorkDir
+	taskWorkDir := o.WorkDir
+	if task.Dir != "" {
+		if filepath.IsAbs(task.Dir) {
+			taskWorkDir = task.Dir
+		} else {
+			taskWorkDir = filepath.Join(o.WorkDir, task.Dir)
+		}
+	}
+	execCmd.Dir = taskWorkDir
 	execCmd.Env = env
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
