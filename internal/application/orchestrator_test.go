@@ -962,3 +962,127 @@ func TestOrchestrator_ServiceAndTaskDir(t *testing.T) {
 		t.Fatalf("expected pwd to contain 'subproject', got: %s", string(data))
 	}
 }
+
+func TestOrchestrator_IndividualServiceLifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "lifecycle-test",
+		Services: map[string]domain.ServiceConfig{
+			"worker": {
+				Command: []string{"sh", "-c", "sleep 30"},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orch.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = orch.Run(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// 1. Testa StopService
+	if err := orch.StopService(ctx, "worker"); err != nil {
+		t.Fatalf("StopService failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if orch.Supervisor.IsProcessRunning("worker") {
+		t.Fatal("expected worker to be stopped")
+	}
+
+	// 2. Testa StartService
+	if err := orch.StartService(ctx, "worker"); err != nil {
+		t.Fatalf("StartService failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !orch.Supervisor.IsProcessRunning("worker") {
+		t.Fatal("expected worker to be running after StartService")
+	}
+
+	// 2.1. Testa StartService redundante (já rodando)
+	if err := orch.StartService(ctx, "worker"); err != nil {
+		t.Fatalf("redundant StartService failed: %v", err)
+	}
+	if !orch.Supervisor.IsProcessRunning("worker") {
+		t.Fatal("expected worker to still be running after redundant StartService")
+	}
+
+	// 3. Testa ToggleService (running -> stopped)
+	if err := orch.ToggleService(ctx, "worker"); err != nil {
+		t.Fatalf("ToggleService (stop) failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if orch.Supervisor.IsProcessRunning("worker") {
+		t.Fatal("expected worker to be stopped after ToggleService")
+	}
+
+	// 4. Testa ToggleService (stopped -> running)
+	if err := orch.ToggleService(ctx, "worker"); err != nil {
+		t.Fatalf("ToggleService (start) failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !orch.Supervisor.IsProcessRunning("worker") {
+		t.Fatal("expected worker to be running after second ToggleService")
+	}
+
+	// 5. Verifica persistência no manifesto em disco
+	runManifestPath := filepath.Join(tempDir, ".vigiadev", "run.json")
+	if mData, err := os.ReadFile(runManifestPath); err == nil {
+		if !strings.Contains(string(mData), "worker") {
+			t.Fatalf("expected run.json to contain 'worker', got: %s", string(mData))
+		}
+	} else {
+		t.Fatalf("expected run.json to exist at %s: %v", runManifestPath, err)
+	}
+}
+
+func TestOrchestrator_ServiceWithDir(t *testing.T) {
+	tempDir := t.TempDir()
+	subDir := filepath.Join(tempDir, "backend")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "service-dir-test",
+		Services: map[string]domain.ServiceConfig{
+			"api": {
+				Dir:     "backend",
+				Command: []string{"sh", "-c", "pwd > service_pwd.txt; sleep 30"},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orch.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = orch.Run(ctx) }()
+
+	time.Sleep(300 * time.Millisecond)
+
+	outFile := filepath.Join(subDir, "service_pwd.txt")
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("expected service_pwd.txt in backend directory: %v", err)
+	}
+	if !strings.Contains(string(data), "backend") {
+		t.Fatalf("expected pwd to contain 'backend', got: %s", string(data))
+	}
+}
+

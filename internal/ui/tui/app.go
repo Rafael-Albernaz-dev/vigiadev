@@ -78,6 +78,12 @@ type probeStatus struct {
 	Error   string
 }
 
+type serviceOperationResultMsg struct {
+	service string
+	op      string
+	err     error
+}
+
 type SystemDoctorInfo struct {
 	OS        string
 	Docker    string
@@ -167,12 +173,18 @@ type AppModel struct {
 	bus             *domain.EventBus
 	cancel          context.CancelFunc
 	restartFunc     func(service string) error
+	toggleFunc      func(service string) error
 	statusMsg       string
 	isFiltering     bool
 	filterQuery     string
 	diagnosticsOpen bool
 	doctorInfo      SystemDoctorInfo
 	probes          map[string]probeStatus
+}
+
+// SetToggleFunc atribui o callback para iniciar ou parar um serviço individualmente.
+func (m *AppModel) SetToggleFunc(fn func(service string) error) {
+	m.toggleFunc = fn
 }
 
 // NewAppModel instantiates the interactive TUI model.
@@ -294,9 +306,24 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			currentTab := m.tabs[m.activeTab]
 			if currentTab != "ALL" && currentTab != "METRICS" && m.restartFunc != nil {
 				m.statusMsg = fmt.Sprintf("Restarting service '%s'...", currentTab)
-				go func(svc string) {
-					_ = m.restartFunc(svc)
-				}(currentTab)
+				svc := currentTab
+				fn := m.restartFunc
+				cmds = append(cmds, func() tea.Msg {
+					err := fn(svc)
+					return serviceOperationResultMsg{service: svc, op: "restart", err: err}
+				})
+			}
+
+		case "s":
+			currentTab := m.tabs[m.activeTab]
+			if currentTab != "ALL" && currentTab != "METRICS" && m.toggleFunc != nil {
+				m.statusMsg = fmt.Sprintf("Toggling service '%s'...", currentTab)
+				svc := currentTab
+				fn := m.toggleFunc
+				cmds = append(cmds, func() tea.Msg {
+					err := fn(svc)
+					return serviceOperationResultMsg{service: svc, op: "toggle", err: err}
+				})
 			}
 
 		case "c":
@@ -433,6 +460,12 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case domain.HealthCheckProbed:
 		m.probes[msg.Service] = probeStatus{Type: msg.Type, Target: msg.Target, Latency: msg.Latency, Success: msg.Success, Error: msg.Error}
+	case serviceOperationResultMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Error on %s for '%s': %v", msg.op, msg.service, msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Service '%s': %s completed", msg.service, msg.op)
+		}
 	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -518,6 +551,10 @@ func (m *AppModel) renderMetricsDashboard() string {
 			}
 		}
 		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Network Port (TCP):"), valStyle.Render(portStr)))
+		if card.Port > 0 {
+			urlStr := fmt.Sprintf("http://localhost:%d", card.Port)
+			content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Service Web URL:"), valStyle.Render(urlStr)))
+		}
 
 		// CPU Usage
 		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("CPU Usage:"), valStyle.Render(telemetry.FormatCPU(card.CPUPercent))))
@@ -616,12 +653,12 @@ func (m *AppModel) View() string {
 		portStr := "-"
 		if card.Port > 0 {
 			if card.IsRemapped {
-				portStr = fmt.Sprintf(":%d➔:%d", card.OriginalPort, card.Port)
+				portStr = fmt.Sprintf("http://localhost:%d➔:%d", card.OriginalPort, card.Port)
 			} else {
-				portStr = fmt.Sprintf(":%d", card.Port)
+				portStr = fmt.Sprintf("http://localhost:%d", card.Port)
 			}
 		}
-		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(14).Render(portStr)
+		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(24).Render(portStr)
 
 		resStr := "-"
 		if card.CPUPercent > 0 || card.MemoryBytes > 0 {
@@ -723,7 +760,11 @@ func (m *AppModel) View() string {
 	}
 
 	if currentTab != "ALL" && currentTab != "METRICS" {
-		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [r] RESTART '%s'  •  [c] Clear  •  [q] Quit", currentTab)
+		urlSnippet := ""
+		if card, ok := m.cards[currentTab]; ok && card.Port > 0 {
+			urlSnippet = fmt.Sprintf("  •  🌐 http://localhost:%d", card.Port)
+		}
+		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [r] Restart '%s'  •  [s] Start/Stop%s  •  [c] Clear  •  [q] Quit", currentTab, urlSnippet)
 	} else if currentTab == "METRICS" {
 		footerText = "[Tab/Click] Switch  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
 	} else {
@@ -834,9 +875,9 @@ func (m *AppModel) renderDiagnostics() string {
 		detail := "Waiting for probe..."
 
 		if card != nil && card.Port > 0 {
-			target = fmt.Sprintf("127.0.0.1:%d", card.Port)
+			target = fmt.Sprintf("http://localhost:%d", card.Port)
 			if card.IsRemapped {
-				target = fmt.Sprintf(":%d [REMAP]", card.Port)
+				target = fmt.Sprintf("http://localhost:%d (remap)", card.Port)
 			}
 		}
 

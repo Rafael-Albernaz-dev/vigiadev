@@ -187,110 +187,119 @@ func (sd *StackDetector) detectNodeServices(usedPorts map[int]bool) nodeDetectio
 		return p
 	}
 
-	// 1. Inspeciona package.json raiz
-	rootPkgPath := filepath.Join(sd.RootDir, "package.json")
-	if data, err := os.ReadFile(rootPkgPath); err == nil {
-		var pkg struct {
-			Scripts      map[string]string `json:"scripts"`
-			Dependencies map[string]string `json:"dependencies"`
-			DevDeps      map[string]string `json:"devDependencies"`
-		}
-		_ = json.Unmarshal(data, &pkg)
+	// 1. Inspeciona se há monorepo profundo com apps modulares (NestJS apps, workspaces)
+	nested := sd.detectNestedMonorepoApps(usedPorts, allocPort)
+	for k, v := range nested.services {
+		result.services[k] = v
+	}
+	result.markers = append(result.markers, nested.markers...)
 
-		pm := sd.packageManager()
-
-		// Procura por scripts modulares do tipo dev:<module>
-		var modularDevs []string
-		for scriptName := range pkg.Scripts {
-			if strings.HasPrefix(scriptName, "dev:") {
-				modularDevs = append(modularDevs, scriptName)
+	// 2. Inspeciona package.json raiz (somente se não encontrou apps modulares profundos)
+	if len(result.services) == 0 {
+		rootPkgPath := filepath.Join(sd.RootDir, "package.json")
+		if data, err := os.ReadFile(rootPkgPath); err == nil {
+			var pkg struct {
+				Scripts      map[string]string `json:"scripts"`
+				Dependencies map[string]string `json:"dependencies"`
+				DevDeps      map[string]string `json:"devDependencies"`
 			}
-		}
-		sort.Strings(modularDevs)
+			_ = json.Unmarshal(data, &pkg)
 
-		if len(modularDevs) > 0 {
-			for _, scriptName := range modularDevs {
-				svcName := strings.TrimPrefix(scriptName, "dev:")
-				cmd := []string{pm, "run", scriptName}
-				scriptBody := pkg.Scripts[scriptName]
-				port := scriptPort(scriptBody)
-				if port == 0 {
-					lower := strings.ToLower(svcName)
-					pref := 3000
-					if strings.Contains(lower, "front") || strings.Contains(lower, "web") || strings.Contains(lower, "ui") {
-						pref = 5173
-					} else if strings.Contains(lower, "api") || strings.Contains(lower, "back") || strings.Contains(lower, "server") {
-						pref = 3000
+			pm := sd.packageManager()
+
+			// Procura por scripts modulares do tipo dev:<module>
+			var modularDevs []string
+			for scriptName := range pkg.Scripts {
+				if strings.HasPrefix(scriptName, "dev:") {
+					modularDevs = append(modularDevs, scriptName)
+				}
+			}
+			sort.Strings(modularDevs)
+
+			if len(modularDevs) > 0 {
+				for _, scriptName := range modularDevs {
+					svcName := strings.TrimPrefix(scriptName, "dev:")
+					cmd := []string{pm, "run", scriptName}
+					scriptBody := pkg.Scripts[scriptName]
+					port := scriptPort(scriptBody)
+					if port == 0 {
+						lower := strings.ToLower(svcName)
+						pref := 3000
+						if strings.Contains(lower, "front") || strings.Contains(lower, "web") || strings.Contains(lower, "ui") {
+							pref = 5173
+						} else if strings.Contains(lower, "api") || strings.Contains(lower, "back") || strings.Contains(lower, "server") {
+							pref = 3000
+						}
+						port = allocPort(pref)
+					} else {
+						usedPorts[port] = true
 					}
-					port = allocPort(pref)
-				} else {
-					usedPorts[port] = true
+
+					svc := domain.ServiceConfig{
+						Command:    cmd,
+						Ports:      []int{port},
+						PortPolicy: domain.PortPolicyRemap,
+						HealthCheck: &domain.HealthCheckConfig{
+							Type: domain.HealthCheckTCP,
+							Port: port,
+						},
+					}
+					result.services[svcName] = svc
+					result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s run %s)", svcName, pm, scriptName))
+				}
+			} else {
+				// Busca script dev ou start padrão na raiz
+				script := "dev"
+				if _, ok := pkg.Scripts["dev"]; !ok {
+					if _, ok := pkg.Scripts["start"]; ok {
+						script = "start"
+					}
 				}
 
-				svc := domain.ServiceConfig{
-					Command:    cmd,
-					Ports:      []int{port},
-					PortPolicy: domain.PortPolicyRemap,
-					HealthCheck: &domain.HealthCheckConfig{
-						Type: domain.HealthCheckTCP,
-						Port: port,
-					},
-				}
-				result.services[svcName] = svc
-				result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s run %s)", svcName, pm, scriptName))
-			}
-		} else {
-			// Busca script dev ou start padrão na raiz
-			script := "dev"
-			if _, ok := pkg.Scripts["dev"]; !ok {
-				if _, ok := pkg.Scripts["start"]; ok {
-					script = "start"
-				}
-			}
+				if _, hasScript := pkg.Scripts[script]; hasScript {
+					depsStr := fmt.Sprintf("%v %v", pkg.Dependencies, pkg.DevDeps)
+					svcName := "frontend"
+					prefPort := 3000
+					if strings.Contains(depsStr, "vite") {
+						svcName = "frontend"
+						prefPort = 5173
+					} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
+						svcName = "frontend"
+						prefPort = 3000
+					} else if strings.Contains(depsStr, "nest") || strings.Contains(depsStr, "express") || strings.Contains(depsStr, "fastify") || strings.Contains(depsStr, "koa") {
+						svcName = "backend"
+						prefPort = 3000
+					}
 
-			if _, hasScript := pkg.Scripts[script]; hasScript {
-				depsStr := fmt.Sprintf("%v %v", pkg.Dependencies, pkg.DevDeps)
-				svcName := "frontend"
-				prefPort := 3000
-				if strings.Contains(depsStr, "vite") {
-					svcName = "frontend"
-					prefPort = 5173
-				} else if strings.Contains(depsStr, "next") || strings.Contains(depsStr, "nuxt") {
-					svcName = "frontend"
-					prefPort = 3000
-				} else if strings.Contains(depsStr, "nest") || strings.Contains(depsStr, "express") || strings.Contains(depsStr, "fastify") || strings.Contains(depsStr, "koa") {
-					svcName = "backend"
-					prefPort = 3000
-				}
+					port := scriptPort(pkg.Scripts[script])
+					if port == 0 {
+						port = allocPort(prefPort)
+					} else {
+						usedPorts[port] = true
+					}
 
-				port := scriptPort(pkg.Scripts[script])
-				if port == 0 {
-					port = allocPort(prefPort)
-				} else {
-					usedPorts[port] = true
-				}
+					cmd := []string{pm, "run", script}
+					if pm == "npm" && script == "start" {
+						cmd = []string{"npm", "start"}
+					}
 
-				cmd := []string{pm, "run", script}
-				if pm == "npm" && script == "start" {
-					cmd = []string{"npm", "start"}
+					svc := domain.ServiceConfig{
+						Command:    cmd,
+						Ports:      []int{port},
+						PortPolicy: domain.PortPolicyRemap,
+						HealthCheck: &domain.HealthCheckConfig{
+							Type: domain.HealthCheckTCP,
+							Port: port,
+						},
+					}
+					result.services[svcName] = svc
+					result.markers = append(result.markers, fmt.Sprintf("Node.js (%s run %s)", pm, script))
 				}
-
-				svc := domain.ServiceConfig{
-					Command:    cmd,
-					Ports:      []int{port},
-					PortPolicy: domain.PortPolicyRemap,
-					HealthCheck: &domain.HealthCheckConfig{
-						Type: domain.HealthCheckTCP,
-						Port: port,
-					},
-				}
-				result.services[svcName] = svc
-				result.markers = append(result.markers, fmt.Sprintf("Node.js (%s run %s)", pm, script))
 			}
 		}
 	}
 
-	// 2. Inspeciona subdiretórios modulares (monorepos) se não cobertos
+	// 3. Inspeciona subdiretórios modulares (monorepos) se não cobertos
 	candidateDirs := []string{
 		"backend", "frontend", "api", "web", "server", "client",
 	}
@@ -309,6 +318,18 @@ func (sd *StackDetector) detectNodeServices(usedPorts map[int]bool) nodeDetectio
 	for _, relDir := range candidateDirs {
 		svcName := filepath.Base(relDir)
 		if _, exists := result.services[svcName]; exists {
+			continue
+		}
+
+		// Se este diretório já contém apps aninhados que foram detectados, pula para não duplicar
+		alreadyCovered := false
+		for _, existingSvc := range result.services {
+			if existingSvc.Dir == relDir || strings.HasPrefix(existingSvc.Dir, relDir+string(filepath.Separator)) {
+				alreadyCovered = true
+				break
+			}
+		}
+		if alreadyCovered {
 			continue
 		}
 		subPkgPath := filepath.Join(sd.RootDir, relDir, "package.json")
@@ -369,6 +390,307 @@ func (sd *StackDetector) detectNodeServices(usedPorts map[int]bool) nodeDetectio
 		}
 		result.services[svcName] = svc
 		result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s run %s)", relDir, subPm, script))
+	}
+
+	return result
+}
+
+func detectProjectPrefix(rootDir string, appNames []string) string {
+	// 1. Root ou sub package.json name com escopo (e.g. "@atlas/workspace" -> "atlas")
+	for _, p := range []string{"package.json", "backend/package.json", "frontend/package.json"} {
+		if data, err := os.ReadFile(filepath.Join(rootDir, p)); err == nil {
+			var pkg struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(data, &pkg); err == nil && pkg.Name != "" {
+				name := pkg.Name
+				if strings.HasPrefix(name, "@") {
+					parts := strings.Split(name[1:], "/")
+					if len(parts) > 0 && parts[0] != "" {
+						return strings.ToLower(parts[0])
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Prefixo compartilhado entre apps (e.g. "atlas-viabilidade", "atlas-erp" -> "atlas")
+	if len(appNames) > 0 {
+		var candidate string
+		for _, name := range appNames {
+			idx := strings.Index(name, "-")
+			if idx > 0 {
+				p := strings.ToLower(name[:idx])
+				if candidate == "" {
+					candidate = p
+				} else if candidate != p {
+					candidate = ""
+					break
+				}
+			} else {
+				candidate = ""
+				break
+			}
+		}
+		if candidate != "" {
+			return candidate
+		}
+	}
+
+	// 3. Base directory name se não for numérico ou pasta temporária
+	base := strings.ToLower(filepath.Base(rootDir))
+	if _, err := strconv.Atoi(base); err != nil && base != "." && base != "/" && base != "" &&
+		!strings.Contains(base, "temp") && !strings.Contains(base, "tmp") && !strings.Contains(base, "test") {
+		return base
+	}
+
+	return ""
+}
+
+func cleanAppName(appName, prefix string) string {
+	lowerName := strings.ToLower(appName)
+	lowerPref := strings.ToLower(prefix)
+	if lowerPref != "" && strings.HasPrefix(lowerName, lowerPref+"-") {
+		return appName[len(prefix)+1:]
+	}
+	if lowerPref != "" && strings.HasPrefix(lowerName, lowerPref+"_") {
+		return appName[len(prefix)+1:]
+	}
+	return appName
+}
+
+func findBackendScript(scripts map[string]string, appName, cleanName string) (string, string) {
+	patterns := []string{
+		"start:dev:" + cleanName,
+		"start:dev:" + appName,
+		"start:" + cleanName + ":dev",
+		"start:" + appName + ":dev",
+		"start:dev",
+		"dev:" + cleanName,
+		"dev:" + appName,
+		"dev",
+	}
+	for _, p := range patterns {
+		if body, ok := scripts[p]; ok {
+			if p == "start:dev" || p == "dev" {
+				if strings.Contains(body, appName) || strings.Contains(body, cleanName) {
+					return p, body
+				}
+			} else {
+				return p, body
+			}
+		}
+	}
+
+	var fallbackName, fallbackBody string
+	for name, body := range scripts {
+		if (strings.Contains(body, "nest start "+appName) || strings.Contains(body, "nest start "+cleanName)) && strings.Contains(body, "--watch") {
+			if !strings.Contains(name, "worker") {
+				return name, body
+			}
+			fallbackName = name
+			fallbackBody = body
+		}
+	}
+	if fallbackName != "" {
+		return fallbackName, fallbackBody
+	}
+
+	for name, body := range scripts {
+		if strings.Contains(body, "nest start "+appName) || strings.Contains(body, "nest start "+cleanName) {
+			if !strings.Contains(name, "worker") {
+				return name, body
+			}
+			fallbackName = name
+			fallbackBody = body
+		}
+	}
+	if fallbackName != "" {
+		return fallbackName, fallbackBody
+	}
+
+	return "", ""
+}
+
+func findFrontendScript(scripts map[string]string, appName, cleanName string) (string, string) {
+	patterns := []string{
+		"dev:" + cleanName,
+		"dev:" + appName,
+		"start:" + cleanName,
+		"start:" + appName,
+	}
+	for _, p := range patterns {
+		if body, ok := scripts[p]; ok {
+			return p, body
+		}
+	}
+	for name, body := range scripts {
+		if strings.HasPrefix(name, "dev") && (strings.Contains(body, appName) || strings.Contains(body, cleanName)) {
+			return name, body
+		}
+	}
+	for name, body := range scripts {
+		if strings.Contains(body, appName) || strings.Contains(body, cleanName) {
+			return name, body
+		}
+	}
+	return "", ""
+}
+
+// detectNestedMonorepoApps inspeciona diretórios modulares como backend/apps/* e frontend/apps/*.
+func (sd *StackDetector) detectNestedMonorepoApps(usedPorts map[int]bool, allocPort func(int) int) nodeDetection {
+	result := nodeDetection{
+		services: make(map[string]domain.ServiceConfig),
+		markers:  make([]string, 0),
+	}
+
+	var allAppNames []string
+	if bEntries, err := os.ReadDir(filepath.Join(sd.RootDir, "backend", "apps")); err == nil {
+		for _, e := range bEntries {
+			if e.IsDir() {
+				allAppNames = append(allAppNames, e.Name())
+			}
+		}
+	}
+	if fEntries, err := os.ReadDir(filepath.Join(sd.RootDir, "frontend", "apps")); err == nil {
+		for _, e := range fEntries {
+			if e.IsDir() {
+				allAppNames = append(allAppNames, e.Name())
+			}
+		}
+	}
+	prefix := detectProjectPrefix(sd.RootDir, allAppNames)
+
+	// 1. Inspeciona backend/apps
+	backendDir := filepath.Join(sd.RootDir, "backend")
+	backendAppsDir := filepath.Join(backendDir, "apps")
+	if entries, err := os.ReadDir(backendAppsDir); err == nil {
+		var backendScripts map[string]string
+		if bData, err := os.ReadFile(filepath.Join(backendDir, "package.json")); err == nil {
+			var bPkg struct {
+				Scripts map[string]string `json:"scripts"`
+			}
+			_ = json.Unmarshal(bData, &bPkg)
+			backendScripts = bPkg.Scripts
+		}
+		bPm := detectPackageManager(backendDir)
+
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			appName := e.Name()
+			clean := cleanAppName(appName, prefix)
+			scriptName, scriptBody := findBackendScript(backendScripts, appName, clean)
+
+			var cmd []string
+			dir := "backend"
+			if scriptName != "" {
+				cmd = []string{bPm, "run", scriptName}
+			} else {
+				innerPkg := filepath.Join(backendAppsDir, appName, "package.json")
+				if iData, err := os.ReadFile(innerPkg); err == nil {
+					var iPkg struct {
+						Scripts map[string]string `json:"scripts"`
+					}
+					_ = json.Unmarshal(iData, &iPkg)
+					if _, hasDev := iPkg.Scripts["dev"]; hasDev {
+						dir = filepath.Join("backend", "apps", appName)
+						cmd = []string{detectPackageManager(filepath.Join(backendAppsDir, appName)), "run", "dev"}
+					}
+				}
+			}
+
+			if len(cmd) == 0 {
+				continue
+			}
+
+			port := scriptPort(scriptBody)
+			if port == 0 {
+				port = allocPort(3000)
+			} else {
+				usedPorts[port] = true
+			}
+
+			svcName := clean + "-backend"
+			result.services[svcName] = domain.ServiceConfig{
+				Dir:        dir,
+				Command:    cmd,
+				Ports:      []int{port},
+				PortPolicy: domain.PortPolicyRemap,
+				HealthCheck: &domain.HealthCheckConfig{
+					Type: domain.HealthCheckTCP,
+					Port: port,
+				},
+			}
+			result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s)", svcName, strings.Join(cmd, " ")))
+		}
+	}
+
+	// 2. Inspeciona frontend/apps
+	frontendDir := filepath.Join(sd.RootDir, "frontend")
+	frontendAppsDir := filepath.Join(frontendDir, "apps")
+	if entries, err := os.ReadDir(frontendAppsDir); err == nil {
+		var frontendScripts map[string]string
+		if fData, err := os.ReadFile(filepath.Join(frontendDir, "package.json")); err == nil {
+			var fPkg struct {
+				Scripts map[string]string `json:"scripts"`
+			}
+			_ = json.Unmarshal(fData, &fPkg)
+			frontendScripts = fPkg.Scripts
+		}
+		fPm := detectPackageManager(frontendDir)
+
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			appName := e.Name()
+			clean := cleanAppName(appName, prefix)
+			scriptName, scriptBody := findFrontendScript(frontendScripts, appName, clean)
+
+			var cmd []string
+			dir := "frontend"
+			if scriptName != "" {
+				cmd = []string{fPm, "run", scriptName}
+			} else {
+				innerPkg := filepath.Join(frontendAppsDir, appName, "package.json")
+				if iData, err := os.ReadFile(innerPkg); err == nil {
+					var iPkg struct {
+						Scripts map[string]string `json:"scripts"`
+					}
+					_ = json.Unmarshal(iData, &iPkg)
+					if _, hasDev := iPkg.Scripts["dev"]; hasDev {
+						dir = filepath.Join("frontend", "apps", appName)
+						cmd = []string{detectPackageManager(filepath.Join(frontendAppsDir, appName)), "run", "dev"}
+					}
+				}
+			}
+
+			if len(cmd) == 0 {
+				continue
+			}
+
+			port := scriptPort(scriptBody)
+			if port == 0 {
+				port = allocPort(5173)
+			} else {
+				usedPorts[port] = true
+			}
+
+			svcName := clean + "-frontend"
+			result.services[svcName] = domain.ServiceConfig{
+				Dir:        dir,
+				Command:    cmd,
+				Ports:      []int{port},
+				PortPolicy: domain.PortPolicyRemap,
+				HealthCheck: &domain.HealthCheckConfig{
+					Type: domain.HealthCheckTCP,
+					Port: port,
+				},
+			}
+			result.markers = append(result.markers, fmt.Sprintf("Node.js %s (%s)", svcName, strings.Join(cmd, " ")))
+		}
 	}
 
 	return result

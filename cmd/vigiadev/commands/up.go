@@ -153,10 +153,15 @@ var upCmd = &cobra.Command{
 		restartFunc := func(service string) error {
 			return orch.RestartService(ctx, service)
 		}
+		toggleFunc := func(service string) error {
+			return orch.ToggleService(ctx, service)
+		}
 
 		// Attach the existing TUI event bridge before starting the orchestrator,
 		// so preflight remap events cannot be lost during TUI startup.
-		program := tea.NewProgram(tui.NewAppModel(cfg.ProjectName, serviceNames, bus, cancel, restartFunc), tea.WithAltScreen(), tea.WithMouseCellMotion())
+		appModel := tui.NewAppModel(cfg.ProjectName, serviceNames, bus, cancel, restartFunc)
+		appModel.SetToggleFunc(toggleFunc)
+		program := tea.NewProgram(appModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		bus.Subscribe(func(event domain.Event) { program.Send(event) })
 		go func() { orchErrChan <- orch.Run(ctx) }()
 		go func() { <-ctx.Done(); program.Quit() }()

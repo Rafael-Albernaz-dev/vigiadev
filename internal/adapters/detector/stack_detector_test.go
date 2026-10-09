@@ -440,3 +440,197 @@ func TestDetect_NodeJS_BackendOnly(t *testing.T) {
 		t.Fatalf("expected express API to be detected as 'backend'")
 	}
 }
+
+func TestDetect_Monorepo_NestedApps(t *testing.T) {
+	dir := t.TempDir()
+
+	// Backend monorepo com apps
+	backendDir := filepath.Join(dir, "backend")
+	_ = os.MkdirAll(filepath.Join(backendDir, "apps", "atlas-viabilidade"), 0755)
+	_ = os.MkdirAll(filepath.Join(backendDir, "apps", "atlas-erp"), 0755)
+
+	backendPkg := `{
+  "name": "backend",
+  "scripts": {
+    "start:dev": "nest start atlas-erp --watch",
+    "start:dev:viabilidade": "nest start atlas-viabilidade --watch"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(backendDir, "package.json"), []byte(backendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Frontend monorepo com apps e workspace
+	frontendDir := filepath.Join(dir, "frontend")
+	_ = os.MkdirAll(filepath.Join(frontendDir, "apps", "atlas-viabilidade"), 0755)
+	_ = os.MkdirAll(filepath.Join(frontendDir, "apps", "atlas-erp"), 0755)
+
+	frontendPkg := `{
+  "name": "frontend",
+  "scripts": {
+    "dev:erp": "npm run dev --workspace @atlas/atlas-erp",
+    "dev:viabilidade": "npm run dev --workspace @atlas/atlas-viabilidade -- --port 5175 --strictPort"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(frontendDir, "package.json"), []byte(frontendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+
+	// Verifica viabilidade-backend
+	viabBack, ok := svcs["viabilidade-backend"]
+	if !ok {
+		t.Fatalf("expected viabilidade-backend service, got: %+v", svcs)
+	}
+	if viabBack.Dir != "backend" {
+		t.Fatalf("expected viabilidade-backend dir 'backend', got %s", viabBack.Dir)
+	}
+	if viabBack.Command[2] != "start:dev:viabilidade" {
+		t.Fatalf("expected command start:dev:viabilidade, got %v", viabBack.Command)
+	}
+
+	// Verifica viabilidade-frontend
+	viabFront, ok := svcs["viabilidade-frontend"]
+	if !ok {
+		t.Fatalf("expected viabilidade-frontend service, got: %+v", svcs)
+	}
+	if viabFront.Dir != "frontend" {
+		t.Fatalf("expected viabilidade-frontend dir 'frontend', got %s", viabFront.Dir)
+	}
+	if len(viabFront.Ports) == 0 || viabFront.Ports[0] != 5175 {
+		t.Fatalf("expected viabilidade-frontend port 5175, got %v", viabFront.Ports)
+	}
+
+	// Verifica erp-backend
+	erpBack, ok := svcs["erp-backend"]
+	if !ok {
+		t.Fatalf("expected erp-backend service, got: %+v", svcs)
+	}
+	if erpBack.Dir != "backend" {
+		t.Fatalf("expected erp-backend dir 'backend', got %s", erpBack.Dir)
+	}
+	if erpBack.Command[2] != "start:dev" {
+		t.Fatalf("expected erp-backend command start:dev, got %v", erpBack.Command)
+	}
+
+	// Verifica erp-frontend
+	erpFront, ok := svcs["erp-frontend"]
+	if !ok {
+		t.Fatalf("expected erp-frontend service, got: %+v", svcs)
+	}
+	if erpFront.Dir != "frontend" {
+		t.Fatalf("expected erp-frontend dir 'frontend', got %s", erpFront.Dir)
+	}
+	if erpFront.Command[2] != "dev:erp" {
+		t.Fatalf("expected erp-frontend command dev:erp, got %v", erpFront.Command)
+	}
+}
+
+func TestDetect_Monorepo_HybridNestedAndPlain(t *testing.T) {
+	dir := t.TempDir()
+
+	// Backend monorepo com apps/api
+	backendDir := filepath.Join(dir, "backend")
+	_ = os.MkdirAll(filepath.Join(backendDir, "apps", "api"), 0755)
+
+	backendPkg := `{
+  "name": "backend",
+  "scripts": {
+    "start:dev:api": "nest start api --watch"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(backendDir, "package.json"), []byte(backendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Frontend simples (não é monorepo de apps, tem apenas frontend/package.json)
+	frontendDir := filepath.Join(dir, "frontend")
+	_ = os.MkdirAll(frontendDir, 0755)
+	frontendPkg := `{
+  "name": "frontend-web",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "vite": "^5.0.0"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(frontendDir, "package.json"), []byte(frontendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+
+	// Garante que o app aninhado de backend foi detectado
+	apiBack, ok := svcs["api-backend"]
+	if !ok {
+		t.Fatalf("expected api-backend in services, got: %+v", svcs)
+	}
+	if apiBack.Dir != "backend" {
+		t.Fatalf("expected api-backend Dir 'backend', got %s", apiBack.Dir)
+	}
+
+	// Garante que o frontend plano também foi detectado (não ignorado por early return)
+	front, ok := svcs["frontend"]
+	if !ok {
+		t.Fatalf("expected frontend in services, got: %+v", svcs)
+	}
+	if front.Dir != "frontend" {
+		t.Fatalf("expected frontend Dir 'frontend', got %s", front.Dir)
+	}
+}
+
+func TestDetect_Monorepo_NestedApps_InnerPackageJson(t *testing.T) {
+	dir := t.TempDir()
+
+	// Backend sem script no root do backend, mas com package.json próprio no app
+	backendDir := filepath.Join(dir, "backend")
+	workerAppDir := filepath.Join(backendDir, "apps", "worker")
+	_ = os.MkdirAll(workerAppDir, 0755)
+
+	backendPkg := `{
+  "name": "backend-root",
+  "scripts": {}
+}`
+	if err := os.WriteFile(filepath.Join(backendDir, "package.json"), []byte(backendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workerPkg := `{
+  "name": "worker",
+  "scripts": {
+    "dev": "node worker.js"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(workerAppDir, "package.json"), []byte(workerPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+	workerBack, ok := svcs["worker-backend"]
+	if !ok {
+		t.Fatalf("expected worker-backend in services, got: %+v", svcs)
+	}
+	expectedDir := filepath.Join("backend", "apps", "worker")
+	if workerBack.Dir != expectedDir {
+		t.Fatalf("expected worker-backend Dir '%s', got '%s'", expectedDir, workerBack.Dir)
+	}
+}
+
+

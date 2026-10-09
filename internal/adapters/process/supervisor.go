@@ -213,6 +213,12 @@ func (s *Supervisor) ProcessStatus(name string) (isRunning bool, exitCode int, r
 	}
 }
 
+// IsProcessRunning verifica se o processo existe e está ativo.
+func (s *Supervisor) IsProcessRunning(name string) bool {
+	running, _, _ := s.ProcessStatus(name)
+	return running
+}
+
 // DiagnoseExit verifica se o processo encerrou prematuramente e identifica causas prováveis (ex: colisão de porta).
 func (s *Supervisor) DiagnoseExit(name string) (exited bool, isPortConflict bool, detail string) {
 	s.mu.Lock()

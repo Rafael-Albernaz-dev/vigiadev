@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -252,7 +253,21 @@ func (o *Orchestrator) waitUntilHealthy(ctx context.Context, service string, cfg
 					IsError:   true,
 				})
 				if isPortConflict {
-					return 0, fmt.Errorf("service '%s' failed on startup due to port conflict: %s", service, diag)
+					port := 0
+					if svc, ok := o.Config.Services[service]; ok && len(svc.Ports) > 0 {
+						port = svc.Ports[0]
+					}
+					sugg := "[vigiadev] 💡 Suggestion: Port collision detected. Run 'vigiadev --kill-ports' or stop the conflicting process."
+					if port > 0 {
+						sugg = fmt.Sprintf("[vigiadev] 💡 Suggestion: Port %d is occupied. Run 'vigiadev --kill-ports' to release it or use dynamic remap.", port)
+					}
+					o.Bus.Publish(domain.LogLineProduced{
+						BaseEvent: domain.NewBaseEvent(),
+						Service:   service,
+						Line:      sugg,
+						IsError:   false,
+					})
+					return 0, fmt.Errorf("service '%s' failed on startup due to port conflict: %s (run 'vigiadev --kill-ports')", service, diag)
 				}
 				return 0, fmt.Errorf("service '%s' failed on startup: %s", service, diag)
 			}
@@ -610,6 +625,14 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 			Line:      fmt.Sprintf("[vigiadev] ERROR: Failed to start compose service '%s': %v", name, err),
 			IsError:   true,
 		})
+		if strings.Contains(err.Error(), "Conflict. The container name") {
+			o.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   name,
+				Line:      "[vigiadev] 💡 Suggestion: Stale Docker container conflict. Run 'docker rm -f <container>' or 'docker compose down' to clean stale containers.",
+				IsError:   false,
+			})
+		}
 		return fmt.Errorf("failed to start compose service '%s': %w", name, err)
 	}
 
@@ -756,6 +779,136 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 
 	return nil
 }
+
+// StopService encerra graciosamente um serviço individual (processo ou container) sob demanda.
+func (o *Orchestrator) StopService(ctx context.Context, name string) error {
+	svc, exists := o.Config.Services[name]
+	if !exists {
+		return fmt.Errorf("service '%s' not found", name)
+	}
+
+	o.Bus.Publish(domain.LogLineProduced{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		Line:      fmt.Sprintf("[vigiadev] Stopping service '%s' on demand...", name),
+		IsError:   false,
+	})
+
+	var stopErr error
+	if svc.ComposeService != "" {
+		if o.Docker != nil {
+			composeFile := svc.ComposeFile
+			if composeFile == "" && o.Config.ComposeFile != "" {
+				composeFile = o.Config.ComposeFile
+			}
+			stopErr = o.Docker.StopComposeService(ctx, name, svc.ComposeService, composeFile, o.WorkDir)
+		}
+	} else if o.Supervisor != nil {
+		stopErr = o.Supervisor.StopProcess(name, 2*time.Second)
+	}
+
+	if stopErr != nil {
+		o.Bus.Publish(domain.LogLineProduced{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			Line:      fmt.Sprintf("[vigiadev] ERROR: Failed to stop service '%s': %v", name, stopErr),
+			IsError:   true,
+		})
+		return fmt.Errorf("failed to stop service '%s': %w", name, stopErr)
+	}
+
+	// Atualiza manifesto persistido
+	o.mu.Lock()
+	if o.manifest.Services != nil {
+		delete(o.manifest.Services, name)
+	}
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+	o.mu.Unlock()
+
+	o.Bus.Publish(domain.ServiceStateChanged{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		OldState:  domain.StateHealthy,
+		NewState:  domain.StateStopped,
+		Detail:    "stopped on demand",
+	})
+	return nil
+}
+
+// StartService inicializa um serviço individual sob demanda.
+func (o *Orchestrator) StartService(ctx context.Context, name string) error {
+	svc, exists := o.Config.Services[name]
+	if !exists {
+		return fmt.Errorf("service '%s' not found", name)
+	}
+
+	// Evita inicialização redundante se já estiver rodando
+	isRunning := false
+	if svc.ComposeService != "" {
+		if o.Docker != nil {
+			info, err := o.Docker.FindContainer(ctx, name, o.WorkDir)
+			if err == nil && info != nil && info.State == "running" {
+				isRunning = true
+			}
+		}
+	} else if o.Supervisor != nil {
+		isRunning = o.Supervisor.IsProcessRunning(name)
+	}
+
+	if isRunning {
+		o.Bus.Publish(domain.LogLineProduced{
+			BaseEvent: domain.NewBaseEvent(),
+			Service:   name,
+			Line:      fmt.Sprintf("[vigiadev] Service '%s' is already running.", name),
+			IsError:   false,
+		})
+		return nil
+	}
+
+	o.Bus.Publish(domain.LogLineProduced{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   name,
+		Line:      fmt.Sprintf("[vigiadev] Starting service '%s' on demand...", name),
+		IsError:   false,
+	})
+
+	if err := o.startService(ctx, name, svc); err != nil {
+		return err
+	}
+
+	// Persiste manifesto atualizado
+	o.mu.Lock()
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+	o.mu.Unlock()
+
+	return nil
+}
+
+// ToggleService alterna o estado de um serviço (para se estiver em execução, inicia caso contrário).
+func (o *Orchestrator) ToggleService(ctx context.Context, name string) error {
+	svc, exists := o.Config.Services[name]
+	if !exists {
+		return fmt.Errorf("service '%s' not found", name)
+	}
+
+	isRunning := false
+	if svc.ComposeService != "" {
+		if o.Docker != nil {
+			info, err := o.Docker.FindContainer(ctx, name, o.WorkDir)
+			if err == nil && info != nil && info.State == "running" {
+				isRunning = true
+			}
+		}
+	} else if o.Supervisor != nil {
+		isRunning = o.Supervisor.IsProcessRunning(name)
+	}
+
+	if isRunning {
+		return o.StopService(ctx, name)
+	}
+	return o.StartService(ctx, name)
+}
+
 
 // EnsureServicesHealthy garante que todos os serviços informados (e suas dependências transitivas) estejam rodando e saudáveis.
 func (o *Orchestrator) EnsureServicesHealthy(ctx context.Context, serviceNames []string) error {
