@@ -1086,3 +1086,66 @@ func TestOrchestrator_ServiceWithDir(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_LayeredEnvIntegration(t *testing.T) {
+	tempDir := t.TempDir()
+	subDir := filepath.Join(tempDir, "backend")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Root .env
+	_ = os.WriteFile(filepath.Join(tempDir, ".env"), []byte("ROOT_VAR=from_root\nSHARED_VAR=shared_root\n"), 0644)
+	// Backend .env
+	_ = os.WriteFile(filepath.Join(subDir, ".env"), []byte("BACKEND_VAR=from_backend\nSHARED_VAR=shared_backend\n"), 0644)
+
+	cfg := &domain.VigiaConfig{
+		Version:     1,
+		ProjectName: "layered-env-test",
+		Services: map[string]domain.ServiceConfig{
+			"api": {
+				Dir:     "backend",
+				Command: []string{"sh", "-c", "echo ROOT_VAR=$ROOT_VAR > env_res.txt; echo BACKEND_VAR=$BACKEND_VAR >> env_res.txt; echo SHARED_VAR=$SHARED_VAR >> env_res.txt; echo YAML_VAR=$YAML_VAR >> env_res.txt; sleep 30"},
+				Env: map[string]string{
+					"YAML_VAR":   "from_yaml",
+					"SHARED_VAR": "overridden_by_yaml",
+				},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orch.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = orch.Run(ctx) }()
+
+	time.Sleep(300 * time.Millisecond)
+
+	outFile := filepath.Join(subDir, "env_res.txt")
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("expected env_res.txt in backend directory: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "ROOT_VAR=from_root") {
+		t.Errorf("expected ROOT_VAR=from_root, got:\n%s", content)
+	}
+	if !strings.Contains(content, "BACKEND_VAR=from_backend") {
+		t.Errorf("expected BACKEND_VAR=from_backend, got:\n%s", content)
+	}
+	if !strings.Contains(content, "YAML_VAR=from_yaml") {
+		t.Errorf("expected YAML_VAR=from_yaml, got:\n%s", content)
+	}
+	if !strings.Contains(content, "SHARED_VAR=overridden_by_yaml") {
+		t.Errorf("expected SHARED_VAR=overridden_by_yaml, got:\n%s", content)
+	}
+}
+
+

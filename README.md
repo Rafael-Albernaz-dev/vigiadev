@@ -21,6 +21,9 @@
   - Live system resource telemetry (CPU %, RAM, Disk I/O).
   - Instant on-demand lifecycle controls: `[s]` to Start/Stop, `[r]` to Restart.
   - Comprehensive diagnostics modal (`[d]`).
+- **🎯 Execution Profiles (`profiles:`)**: Declare named service groups (e.g., `profiles: { api: [...], full: [...] }`) and boot targeted sub-graphs with `vigiadev up --profile <name>` or via the interactive terminal selector.
+- **📄 Layered Environment Hierarchy (`.env`)**: Strict 6-layer precedence merging (`.env` ➔ `.env.local` ➔ `<dir>/.env` ➔ `<dir>/.env.local` ➔ `env_file:` ➔ `env:`), isolating modular credentials cleanly.
+- **🐳 Docker Stale Container Auto-Remediation**: Automatically recovers from Docker name conflicts by removing stopped/dead stale containers, while protecting actively running containers.
 - **🔌 Intelligent Port Conflict Management**: Proactive detection of `EADDRINUSE` with non-invasive remediation tips, deterministic sequential remapping, and preflight conflict inspection (`[y/N/remap]`).
 - **🏃 Task Runner with Keep-Alive**: Execute one-off commands (`vigiadev run <task>`) with automated topological dependency resolution, TCP readiness probes, and argument passthrough.
 
@@ -79,8 +82,12 @@ vigiadev validate
 ### 3. Spin up the environment
 
 ```bash
-# Starts all services with the interactive TUI:
+# Starts all services with interactive TUI (presents profile selector if profiles are defined):
 vigiadev up
+
+# Boot a specific profile directly:
+vigiadev up --profile api
+vigiadev up -p viabilidade
 
 # Start only a subset of services (dependencies are automatically resolved):
 vigiadev up api frontend
@@ -126,7 +133,7 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | Command | Description |
 | :--- | :--- |
 | `vigiadev init [--local] [-f]` | Inspects project repository and generates configuration |
-| `vigiadev up [services...]` | Orchestrates and boots services with interactive TUI or streaming |
+| `vigiadev up [services...] [-p profile]` | Orchestrates and boots services (or profile subset) with interactive TUI or streaming |
 | `vigiadev run <task> [--no-deps]` | Executes a declared task resolving prerequisite dependencies |
 | `vigiadev down` | Shuts down processes and containers owned by the active session |
 | `vigiadev remove [-f] [--keep-config]` | Removes `.vigiadev/` runtime data, locks, and optionally configs |
@@ -145,6 +152,11 @@ Configuration lookup order: `--config` flag ➔ `vigiadev.local.yaml` ➔ `vigia
 version: 1
 project_name: my-app
 
+# Declarative execution profiles
+profiles:
+  api: [postgres, redis, backend]
+  full: [postgres, redis, backend, frontend]
+
 services:
   # Docker Compose integration
   postgres:
@@ -160,13 +172,14 @@ services:
     ports: [6379]
     port_policy: reuse
 
-  # Host process in a modular sub-directory
+  # Host process in a modular sub-directory with layered env
   backend:
     dir: backend
     command: ["npm", "run", "start:dev"]
     depends_on: [postgres, redis]
     ports: [3000]
     port_policy: remap
+    env_file: .env.local
     watch: true
     watch_paths: ["src/"]
     healthcheck:

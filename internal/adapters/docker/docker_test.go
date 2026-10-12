@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -433,4 +435,87 @@ func TestFindComposeFile(t *testing.T) {
 		t.Errorf("esperava precedência de 'compose.yaml', obteve '%s'", f)
 	}
 }
+
+func TestDockerCompose_StaleContainerRemediation(t *testing.T) {
+	// Cenário 1: Container stale parado (exited) -> remove automaticamente e recria
+	var removedContainers []string
+	var loggedLines []string
+	attempts := 0
+
+	staleRunner := &docker.DefaultComposeRunner{
+		CommandExecutor: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			attempts++
+			if attempts == 1 {
+				// Simula comando que falha com colisão de nome
+				return exec.Command("sh", "-c", "echo 'Error response from daemon: Conflict. The container name \"/app-db-1\" is already in use by container \"abcd1234dead\".' >&2; exit 1")
+			}
+			// Segunda tentativa após remoção tem sucesso
+			return exec.Command("sh", "-c", "echo 'Container app-db-1 started'; exit 0")
+		},
+		InspectFn: func(ctx context.Context, containerRef string) (bool, string, error) {
+			if containerRef != "app-db-1" {
+				t.Errorf("expected containerRef 'app-db-1', got '%s'", containerRef)
+			}
+			return false, "exited", nil
+		},
+		RemoveFn: func(ctx context.Context, containerRef string) error {
+			removedContainers = append(removedContainers, containerRef)
+			return nil
+		},
+	}
+
+	logWriter := func(line string) {
+		loggedLines = append(loggedLines, line)
+	}
+
+	err := staleRunner.Up(context.Background(), "db", "", t.TempDir(), logWriter)
+	if err != nil {
+		t.Fatalf("expected successful Up after stale container remediation, got: %v", err)
+	}
+
+	if len(removedContainers) != 1 || removedContainers[0] != "app-db-1" {
+		t.Errorf("expected container 'app-db-1' to be removed, got: %v", removedContainers)
+	}
+
+	var foundStaleLog bool
+	for _, l := range loggedLines {
+		if strings.Contains(l, "Removing stale container") {
+			foundStaleLog = true
+			break
+		}
+	}
+	if !foundStaleLog {
+		t.Errorf("expected log message about removing stale container, got: %v", loggedLines)
+	}
+
+	// Cenário 2: Container em execução (running) -> preserva sem remover e falha com erro amigável (DEC-005)
+	var runningRemoved []string
+	runningRunner := &docker.DefaultComposeRunner{
+		CommandExecutor: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			return exec.Command("sh", "-c", "echo 'Conflict. The container name \"/app-running-1\" is already in use by container \"running999\".' >&2; exit 1")
+		},
+		InspectFn: func(ctx context.Context, containerRef string) (bool, string, error) {
+			return true, "running", nil
+		},
+		RemoveFn: func(ctx context.Context, containerRef string) error {
+			runningRemoved = append(runningRemoved, containerRef)
+			return nil
+		},
+	}
+
+	errRunning := runningRunner.Up(context.Background(), "running", "", t.TempDir(), nil)
+	if errRunning == nil {
+		t.Fatal("expected error when container is running by external process")
+	}
+
+	if len(runningRemoved) != 0 {
+		t.Errorf("expected running container NOT to be removed, but remove was called on: %v", runningRemoved)
+	}
+
+	expectedSub := "is already in use and currently running by an external process"
+	if !strings.Contains(errRunning.Error(), expectedSub) {
+		t.Errorf("expected error message to contain '%s', got: %v", expectedSub, errRunning)
+	}
+}
+
 

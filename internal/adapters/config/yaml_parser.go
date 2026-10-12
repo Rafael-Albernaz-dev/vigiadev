@@ -54,6 +54,7 @@ type rawConfig struct {
 	Version     int                             `yaml:"version"`
 	ProjectName string                          `yaml:"project_name"`
 	ComposeFile string                          `yaml:"compose_file,omitempty"`
+	Profiles    map[string][]string             `yaml:"profiles,omitempty"`
 	Services    map[string]domain.ServiceConfig `yaml:"services,omitempty"`
 	Tasks       map[string]rawTaskConfig        `yaml:"tasks,omitempty"`
 }
@@ -81,6 +82,7 @@ func LoadConfig(filePath string) (*domain.VigiaConfig, error) {
 		Version:     raw.Version,
 		ProjectName: raw.ProjectName,
 		ComposeFile: raw.ComposeFile,
+		Profiles:    raw.Profiles,
 		Services:    raw.Services,
 		Tasks:       make(map[string]domain.TaskConfig),
 	}

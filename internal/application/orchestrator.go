@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/health"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
@@ -407,6 +408,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 // startService cuida da alocação de portas, inicialização e verificação de saúde de um serviço.
 func (o *Orchestrator) startService(ctx context.Context, name string, svc domain.ServiceConfig) error {
+	resolvedEnv, err := config.ResolveLayeredEnv(o.WorkDir, svc)
+	if err != nil {
+		return fmt.Errorf("failed to resolve layered env for service '%s': %w", name, err)
+	}
+	svc.Env = resolvedEnv
+
 	effectiveCmd := svc.Command
 	effectiveEnv := svc.Env
 	var assignedPort int

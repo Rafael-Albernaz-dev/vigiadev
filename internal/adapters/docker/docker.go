@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -70,75 +71,175 @@ func FindComposeFile(workDir string) string {
 	return ""
 }
 
-// DefaultComposeRunner executa comandos reais de 'docker compose'.
-type DefaultComposeRunner struct{}
+// DefaultComposeRunner executa comandos reais de 'docker compose' com suporte a auto-remediação de containers stale.
+type DefaultComposeRunner struct {
+	CommandExecutor func(ctx context.Context, name string, args ...string) *exec.Cmd
+	InspectFn       func(ctx context.Context, containerRef string) (running bool, status string, err error)
+	RemoveFn        func(ctx context.Context, containerRef string) error
+}
 
-func (d *DefaultComposeRunner) Up(ctx context.Context, service string, composeFile string, workDir string, logWriter func(line string)) error {
-	args := []string{"compose"}
-	if composeFile != "" {
-		args = append(args, "-f", composeFile)
-	} else if cf := FindComposeFile(workDir); cf != "" {
-		args = append(args, "-f", cf)
+func extractConflictingContainer(errMsg string) string {
+	// Padrão 1: container name "/<nome>" is already in use
+	reName := regexp.MustCompile(`(?i)(?:container name|the container name)\s+"/?([^"]+)"\s+is already in use`)
+	if matches := reName.FindStringSubmatch(errMsg); len(matches) > 1 {
+		return strings.TrimPrefix(matches[1], "/")
 	}
-	args = append(args, "up", "-d", service)
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Dir = workDir
+	// Padrão 2: is already in use by container "<id>"
+	reID := regexp.MustCompile(`(?i)is already in use by container\s+"([^"]+)"`)
+	if matches := reID.FindStringSubmatch(errMsg); len(matches) > 1 {
+		return matches[1]
+	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	// Padrão 3: container "<nome>" is already in use
+	reContainer := regexp.MustCompile(`(?i)container\s+"/?([^"]+)"\s+is already in use`)
+	if matches := reContainer.FindStringSubmatch(errMsg); len(matches) > 1 {
+		return strings.TrimPrefix(matches[1], "/")
+	}
+
+	return ""
+}
+
+func defaultInspectContainer(ctx context.Context, containerRef string) (bool, string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Status}}|{{.State.Running}}", containerRef)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
+		return false, "", fmt.Errorf("failed to inspect container '%s': %s: %w", containerRef, strings.TrimSpace(string(out)), err)
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	parts := strings.Split(strings.TrimSpace(string(out)), "|")
+	if len(parts) >= 2 {
+		status := strings.ToLower(strings.TrimSpace(parts[0]))
+		running := strings.ToLower(strings.TrimSpace(parts[1])) == "true"
+		return running, status, nil
+	}
+	return false, "", fmt.Errorf("unexpected inspect output for '%s': %s", containerRef, string(out))
+}
+
+func defaultRemoveContainer(ctx context.Context, containerRef string) error {
+	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", containerRef)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start docker compose: %w", err)
-	}
-
-	var errLines []string
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			text := scanner.Text()
-			if logWriter != nil {
-				logWriter(text)
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			text := scanner.Text()
-			mu.Lock()
-			errLines = append(errLines, text)
-			mu.Unlock()
-			if logWriter != nil {
-				logWriter(text)
-			}
-		}
-	}()
-
-	wg.Wait()
-	if err := cmd.Wait(); err != nil {
-		mu.Lock()
-		detail := strings.Join(errLines, " | ")
-		mu.Unlock()
-		if detail != "" {
-			return fmt.Errorf("docker compose up -d failed: %s: %w", detail, err)
-		}
-		return fmt.Errorf("docker compose up -d failed: %w", err)
+		return fmt.Errorf("failed to remove container '%s': %s: %w", containerRef, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+func (d *DefaultComposeRunner) Up(ctx context.Context, service string, composeFile string, workDir string, logWriter func(line string)) error {
+	runUp := func() (error, string) {
+		args := []string{"compose"}
+		if composeFile != "" {
+			args = append(args, "-f", composeFile)
+		} else if cf := FindComposeFile(workDir); cf != "" {
+			args = append(args, "-f", cf)
+		}
+		args = append(args, "up", "-d", service)
+
+		var cmd *exec.Cmd
+		if d.CommandExecutor != nil {
+			cmd = d.CommandExecutor(ctx, "docker", args...)
+		} else {
+			cmd = exec.CommandContext(ctx, "docker", args...)
+		}
+		cmd.Dir = workDir
+
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			return err, ""
+		}
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			return err, ""
+		}
+
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start docker compose: %w", err), ""
+		}
+
+		var errLines []string
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			scanner := bufio.NewScanner(stdoutPipe)
+			for scanner.Scan() {
+				text := scanner.Text()
+				if logWriter != nil {
+					logWriter(text)
+				}
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			scanner := bufio.NewScanner(stderrPipe)
+			for scanner.Scan() {
+				text := scanner.Text()
+				mu.Lock()
+				errLines = append(errLines, text)
+				mu.Unlock()
+				if logWriter != nil {
+					logWriter(text)
+				}
+			}
+		}()
+
+		wg.Wait()
+		if err := cmd.Wait(); err != nil {
+			mu.Lock()
+			detail := strings.Join(errLines, " | ")
+			mu.Unlock()
+			return err, detail
+		}
+		return nil, ""
+	}
+
+	err, detail := runUp()
+	if err == nil {
+		return nil
+	}
+
+	// Verifica se é conflito de nome de container e aplica auto-remediação conforme DEC-033
+	conflicting := extractConflictingContainer(detail)
+	if conflicting != "" {
+		inspectFn := d.InspectFn
+		if inspectFn == nil {
+			inspectFn = defaultInspectContainer
+		}
+		removeFn := d.RemoveFn
+		if removeFn == nil {
+			removeFn = defaultRemoveContainer
+		}
+
+		running, status, inspectErr := inspectFn(ctx, conflicting)
+		if inspectErr == nil {
+			if !running || status == "exited" || status == "dead" || status == "created" {
+				if logWriter != nil {
+					logWriter(fmt.Sprintf("[vigiadev] Removing stale container '%s' to resolve name conflict...", conflicting))
+				}
+				if rmErr := removeFn(ctx, conflicting); rmErr == nil {
+					// Tenta novamente uma vez
+					retryErr, retryDetail := runUp()
+					if retryErr == nil {
+						return nil
+					}
+					if retryDetail != "" {
+						return fmt.Errorf("docker compose up -d failed after stale cleanup: %s: %w", retryDetail, retryErr)
+					}
+					return retryErr
+				}
+			} else {
+				// Container está ativo (running) por processo alheio: preserva (DEC-005) e falha com erro amigável
+				return fmt.Errorf("container '%s' is already in use and currently running by an external process. Run 'docker rm -f %s' to recreate", conflicting, conflicting)
+			}
+		}
+	}
+
+	if detail != "" {
+		return fmt.Errorf("docker compose up -d failed: %s: %w", detail, err)
+	}
+	return fmt.Errorf("docker compose up -d failed: %w", err)
 }
 
 func (d *DefaultComposeRunner) Stop(ctx context.Context, service string, composeFile string, workDir string) error {

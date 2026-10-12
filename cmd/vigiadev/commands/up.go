@@ -28,9 +28,10 @@ import (
 )
 
 var (
-	noTUI     bool
-	killPorts bool
-	forceUp   bool
+	noTUI       bool
+	killPorts   bool
+	forceUp     bool
+	profileFlag string
 )
 
 var upCmd = &cobra.Command{
@@ -87,18 +88,18 @@ var upCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to load configuration: %w", err)
 		}
-		if len(args) > 0 {
-			cfg, err = FilterServices(cfg, args)
-			if err != nil {
-				return err
-			}
+		input, isFile := cmd.InOrStdin().(*os.File)
+		interactive := isFile && isatty.IsTerminal(input.Fd()) && os.Getenv("CI") == ""
+
+		cfg, err = ResolveProfilesAndServices(cfg, profileFlag, args, cmd.InOrStdin(), cmd.OutOrStdout(), interactive && !forceUp)
+		if err != nil {
+			return err
 		}
+
 		if err := ReapOrphanedProcesses(cwd, cfg.ProjectName); err != nil {
 			return err
 		}
 
-		input, isFile := cmd.InOrStdin().(*os.File)
-		interactive := isFile && isatty.IsTerminal(input.Fd()) && os.Getenv("CI") == ""
 		remaps, err := PreflightPorts(cfg, cmd.InOrStdin(), cmd.OutOrStdout(), interactive, forceUp, killPorts)
 		if err != nil {
 			return err
@@ -187,6 +188,7 @@ func init() {
 	upCmd.Flags().BoolVar(&noTUI, "no-tui", false, "Run in direct streaming mode on stdout (headless/no TUI)")
 	upCmd.Flags().BoolVarP(&killPorts, "kill-ports", "k", false, "Resolve port conflicts by terminating listeners (confirmation in interactive terminals)")
 	upCmd.Flags().BoolVarP(&forceUp, "force", "f", false, "Authorize configured port kills without prompting")
+	upCmd.Flags().StringVarP(&profileFlag, "profile", "p", "", "Execution profile to run (filters services)")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -384,3 +386,78 @@ func FilterServices(cfg *domain.VigiaConfig, targets []string) (*domain.VigiaCon
 	}
 	return &filtered, nil
 }
+
+// PromptProfileSelection apresenta o menu interativo para seleção de perfil conforme DEC-033.
+func PromptProfileSelection(cfg *domain.VigiaConfig, in io.Reader, out io.Writer) (string, error) {
+	if len(cfg.Profiles) == 0 {
+		return "", nil
+	}
+
+	var profileNames []string
+	for name := range cfg.Profiles {
+		profileNames = append(profileNames, name)
+	}
+	sort.Strings(profileNames)
+
+	fmt.Fprintln(out, "Select execution profile:")
+	for i, name := range profileNames {
+		fmt.Fprintf(out, "  [%d] %s (%d services)\n", i+1, name, len(cfg.Profiles[name]))
+	}
+	fmt.Fprintln(out, "  [A] All services (default)")
+	fmt.Fprint(out, "Select [A]: ")
+
+	scanner := bufio.NewScanner(in)
+	if scanner.Scan() {
+		choice := strings.TrimSpace(scanner.Text())
+		if choice == "" || strings.EqualFold(choice, "a") || strings.EqualFold(choice, "all") {
+			return "all", nil
+		}
+
+		for i, name := range profileNames {
+			if choice == fmt.Sprintf("%d", i+1) || strings.EqualFold(choice, name) {
+				return name, nil
+			}
+		}
+
+		fmt.Fprintf(out, "Invalid selection %q, proceeding with All services.\n", choice)
+		return "all", nil
+	}
+	return "all", nil
+}
+
+// ResolveProfilesAndServices aplica as regras de filtragem por profile e/ou argumentos posicionais.
+func ResolveProfilesAndServices(cfg *domain.VigiaConfig, profile string, args []string, in io.Reader, out io.Writer, interactive bool) (*domain.VigiaConfig, error) {
+	if profile != "" {
+		svcs, exists := cfg.Profiles[profile]
+		if !exists {
+			var available []string
+			for p := range cfg.Profiles {
+				available = append(available, p)
+			}
+			sort.Strings(available)
+			return nil, fmt.Errorf("profile %q not found. Available profiles: %s", profile, strings.Join(available, ", "))
+		}
+		targets := append([]string{}, svcs...)
+		if len(args) > 0 {
+			targets = append(targets, args...)
+		}
+		return FilterServices(cfg, targets)
+	}
+
+	if len(args) > 0 {
+		return FilterServices(cfg, args)
+	}
+
+	if len(cfg.Profiles) > 0 && interactive {
+		selected, err := PromptProfileSelection(cfg, in, out)
+		if err != nil {
+			return nil, err
+		}
+		if selected != "" && selected != "all" {
+			return FilterServices(cfg, cfg.Profiles[selected])
+		}
+	}
+
+	return cfg, nil
+}
+

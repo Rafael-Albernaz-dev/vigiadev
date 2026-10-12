@@ -377,3 +377,78 @@ func TestFilterServices(t *testing.T) {
 		t.Fatalf("expected error listing available services, got: %v", err)
 	}
 }
+
+func TestUpCommand_ProfileFilter(t *testing.T) {
+	cfg := &domain.VigiaConfig{
+		ProjectName: "profiles-demo",
+		Profiles: map[string][]string{
+			"viabilidade": {"postgres", "redis", "viabilidade-backend", "viabilidade-frontend"},
+			"erp":         {"postgres", "erp-backend"},
+			"minimal":     {"viabilidade-frontend"}, // deve resolver transitivas: viabilidade-backend, postgres, redis
+		},
+		Services: map[string]domain.ServiceConfig{
+			"postgres":             {Command: []string{"postgres"}},
+			"redis":                {Command: []string{"redis"}},
+			"viabilidade-backend":  {Command: []string{"api"}, DependsOn: []string{"postgres", "redis"}},
+			"viabilidade-frontend": {Command: []string{"web"}, DependsOn: []string{"viabilidade-backend"}},
+			"erp-backend":          {Command: []string{"erp"}, DependsOn: []string{"postgres"}},
+			"analytics":            {Command: []string{"analytics"}},
+		},
+	}
+
+	// 1. Filtragem por profile explícito "viabilidade"
+	res, err := commands.ResolveProfilesAndServices(cfg, "viabilidade", nil, nil, nil, false)
+	if err != nil {
+		t.Fatalf("unexpected error resolving profile: %v", err)
+	}
+	if len(res.Services) != 4 {
+		t.Fatalf("expected 4 services for profile viabilidade, got %d: %v", len(res.Services), res.Services)
+	}
+	if _, ok := res.Services["erp-backend"]; ok {
+		t.Errorf("erp-backend should not be included in viabilidade profile")
+	}
+	if _, ok := res.Services["analytics"]; ok {
+		t.Errorf("analytics should not be included in viabilidade profile")
+	}
+
+	// 2. Resolução de dependências transitivas com profile "minimal"
+	resMin, err := commands.ResolveProfilesAndServices(cfg, "minimal", nil, nil, nil, false)
+	if err != nil {
+		t.Fatalf("unexpected error resolving minimal profile: %v", err)
+	}
+	if len(resMin.Services) != 4 {
+		t.Fatalf("expected 4 services with transitives for minimal, got %d", len(resMin.Services))
+	}
+	for _, expected := range []string{"viabilidade-frontend", "viabilidade-backend", "postgres", "redis"} {
+		if _, ok := resMin.Services[expected]; !ok {
+			t.Errorf("expected transitive service %q to be included", expected)
+		}
+	}
+
+	// 3. Profile inexistente
+	_, errNotFound := commands.ResolveProfilesAndServices(cfg, "nonexistent", nil, nil, nil, false)
+	if errNotFound == nil || !strings.Contains(errNotFound.Error(), "Available profiles:") {
+		t.Fatalf("expected error with available profiles list, got: %v", errNotFound)
+	}
+
+	// 4. Seletor interativo: escolha por número e por All
+	var out bytes.Buffer
+	// Input escolhendo a opção correspondente a erp
+	resPrompt, errPrompt := commands.ResolveProfilesAndServices(cfg, "", nil, strings.NewReader("erp\n"), &out, true)
+	if errPrompt != nil {
+		t.Fatalf("unexpected prompt error: %v", errPrompt)
+	}
+	if len(resPrompt.Services) != 2 {
+		t.Fatalf("expected 2 services for erp prompt choice, got %d", len(resPrompt.Services))
+	}
+
+	// Input escolhendo [A] All services
+	resAll, errAll := commands.ResolveProfilesAndServices(cfg, "", nil, strings.NewReader("A\n"), &out, true)
+	if errAll != nil {
+		t.Fatalf("unexpected all prompt error: %v", errAll)
+	}
+	if len(resAll.Services) != 6 {
+		t.Fatalf("expected all 6 services for 'A' choice, got %d", len(resAll.Services))
+	}
+}
+

@@ -238,3 +238,78 @@ tasks:
 		t.Error("esperava erro ao referenciar serviço inexistente em depends_on de task")
 	}
 }
+
+func TestLoadConfig_ProfilesAndEnvFile(t *testing.T) {
+	tempDir := t.TempDir()
+	content := `
+version: 1
+project_name: test-profiles
+profiles:
+  viabilidade:
+    - postgres
+    - redis
+    - viabilidade-backend
+    - viabilidade-frontend
+  erp:
+    - postgres
+    - erp-backend
+services:
+  postgres:
+    command: ["postgres"]
+  redis:
+    command: ["redis-server"]
+  viabilidade-backend:
+    command: ["npm", "run", "start"]
+    dir: "backend/apps/viabilidade"
+    env_file: ".env.viabilidade"
+  viabilidade-frontend:
+    command: ["npm", "run", "dev"]
+    dir: "frontend/apps/viabilidade"
+    env_file: [".env.local", ".env.frontend"]
+  erp-backend:
+    command: ["npm", "run", "erp"]
+`
+	path := filepath.Join(tempDir, "vigiadev.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("falha ao carregar config com perfis: %v", err)
+	}
+
+	if len(cfg.Profiles) != 2 {
+		t.Fatalf("esperava 2 profiles, obteve %d", len(cfg.Profiles))
+	}
+
+	viab, exists := cfg.Profiles["viabilidade"]
+	if !exists {
+		t.Fatal("profile 'viabilidade' não encontrado")
+	}
+	if len(viab) != 4 {
+		t.Errorf("esperava 4 serviços no profile viabilidade, obteve %d", len(viab))
+	}
+
+	erp, exists := cfg.Profiles["erp"]
+	if !exists {
+		t.Fatal("profile 'erp' não encontrado")
+	}
+	if len(erp) != 2 {
+		t.Errorf("esperava 2 serviços no profile erp, obteve %d", len(erp))
+	}
+
+	// Verifica env_file string
+	viabBackend := cfg.Services["viabilidade-backend"]
+	if viabBackend.EnvFile != ".env.viabilidade" {
+		t.Errorf("esperava EnvFile='.env.viabilidade', obteve %v", viabBackend.EnvFile)
+	}
+
+	// Verifica env_file slice
+	viabFrontend := cfg.Services["viabilidade-frontend"]
+	sliceEnv, ok := viabFrontend.EnvFile.([]interface{})
+	if !ok || len(sliceEnv) != 2 {
+		t.Errorf("esperava EnvFile como slice de 2 elementos, obteve %v", viabFrontend.EnvFile)
+	}
+}
+

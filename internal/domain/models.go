@@ -45,6 +45,7 @@ type ServiceConfig struct {
 	PortPolicy     PortPolicy         `yaml:"port_policy,omitempty"`
 	DependsOn      []string           `yaml:"depends_on,omitempty"`
 	Env            map[string]string  `yaml:"env,omitempty"`
+	EnvFile        interface{}        `yaml:"env_file,omitempty"`
 	HealthCheck    *HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	ComposeService string             `yaml:"compose_service,omitempty"`
 	ComposeFile    string             `yaml:"compose_file,omitempty"`
@@ -68,6 +69,7 @@ type VigiaConfig struct {
 	Version     int                      `yaml:"version"`
 	ProjectName string                   `yaml:"project_name"`
 	ComposeFile string                   `yaml:"compose_file,omitempty"`
+	Profiles    map[string][]string      `yaml:"profiles,omitempty"`
 	Services    map[string]ServiceConfig `yaml:"services,omitempty"`
 	Tasks       map[string]TaskConfig    `yaml:"tasks,omitempty"`
 }
