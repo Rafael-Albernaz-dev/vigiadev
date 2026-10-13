@@ -160,7 +160,17 @@ var upCmd = &cobra.Command{
 
 		// Attach the existing TUI event bridge before starting the orchestrator,
 		// so preflight remap events cannot be lost during TUI startup.
-		appModel := tui.NewAppModel(cfg.ProjectName, serviceNames, bus, cancel, restartFunc)
+		servicePorts := make(map[string]int)
+		for name, svc := range cfg.Services {
+			if len(svc.Ports) > 0 {
+				servicePorts[name] = svc.Ports[0]
+			}
+		}
+		for _, remap := range remaps {
+			servicePorts[remap.Service] = remap.TargetPort
+		}
+
+		appModel := tui.NewAppModel(cfg.ProjectName, serviceNames, servicePorts, bus, cancel, restartFunc)
 		appModel.SetToggleFunc(toggleFunc)
 		program := tea.NewProgram(appModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		bus.Subscribe(func(event domain.Event) { program.Send(event) })

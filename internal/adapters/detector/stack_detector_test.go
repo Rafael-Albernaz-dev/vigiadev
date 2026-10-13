@@ -633,4 +633,129 @@ func TestDetect_Monorepo_NestedApps_InnerPackageJson(t *testing.T) {
 	}
 }
 
+func TestDetect_Monorepo_PortInspectionAndDependsOn(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Docker compose com postgres e redis
+	composeContent := `
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(composeContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Backend apps: viabilidade (com test-port.ts retornando 3175) e erp
+	backendDir := filepath.Join(dir, "backend")
+	viabSrcDir := filepath.Join(backendDir, "apps", "atlas-viabilidade", "src")
+	_ = os.MkdirAll(viabSrcDir, 0755)
+	_ = os.MkdirAll(filepath.Join(backendDir, "apps", "atlas-erp", "src"), 0755)
+
+	testPortTs := `
+export function viabilidadePort(env: any): number {
+  return 3175;
+}
+`
+	if err := os.WriteFile(filepath.Join(viabSrcDir, "test-port.ts"), []byte(testPortTs), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	backendPkg := `{
+  "name": "backend",
+  "scripts": {
+    "start:dev:viabilidade": "nest start atlas-viabilidade --watch",
+    "start:dev": "nest start atlas-erp --watch"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(backendDir, "package.json"), []byte(backendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Frontend apps: viabilidade (com vite.config.ts proxy para 3175) e erp
+	frontendDir := filepath.Join(dir, "frontend")
+	viabFrontDir := filepath.Join(frontendDir, "apps", "atlas-viabilidade")
+	_ = os.MkdirAll(viabFrontDir, 0755)
+	_ = os.MkdirAll(filepath.Join(frontendDir, "apps", "atlas-erp"), 0755)
+
+	viteConfigTs := `
+import { defineConfig } from "vite";
+const backendPort = 3175;
+export default defineConfig({
+  server: { proxy: { "/api": { target: "http://127.0.0.1:3175" } } }
+});
+`
+	if err := os.WriteFile(filepath.Join(viabFrontDir, "vite.config.ts"), []byte(viteConfigTs), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	frontendPkg := `{
+  "name": "frontend",
+  "scripts": {
+    "dev:viabilidade": "npm run dev --workspace @atlas/atlas-viabilidade -- --port 5175 --strictPort",
+    "dev:erp": "npm run dev --workspace @atlas/atlas-erp"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(frontendDir, "package.json"), []byte(frontendPkg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := detector.NewStackDetector(dir).Detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svcs := result.Config.Services
+
+	// 1. viabilidade-backend deve ter detectado a porta 3175 (não 3000 ou 3002)
+	viabBack, ok := svcs["viabilidade-backend"]
+	if !ok {
+		t.Fatalf("viabilidade-backend não encontrado: %+v", svcs)
+	}
+	if len(viabBack.Ports) == 0 || viabBack.Ports[0] != 3175 {
+		t.Fatalf("esperava porta 3175 no viabilidade-backend, obteve %v", viabBack.Ports)
+	}
+	if viabBack.HealthCheck == nil || viabBack.HealthCheck.Port != 3175 {
+		t.Fatalf("esperava healthcheck na porta 3175, obteve %+v", viabBack.HealthCheck)
+	}
+
+	// 2. viabilidade-frontend deve conter depends_on: [viabilidade-backend]
+	viabFront, ok := svcs["viabilidade-frontend"]
+	if !ok {
+		t.Fatalf("viabilidade-frontend não encontrado: %+v", svcs)
+	}
+	hasDep := false
+	for _, dep := range viabFront.DependsOn {
+		if dep == "viabilidade-backend" {
+			hasDep = true
+			break
+		}
+	}
+	if !hasDep {
+		t.Fatalf("esperava viabilidade-frontend com depends_on: [viabilidade-backend], obteve %v", viabFront.DependsOn)
+	}
+
+	// 3. Profiles devem ter sido sintetizados para os módulos
+	if len(result.Config.Profiles) == 0 {
+		t.Fatalf("esperava profiles sintetizados, obteve 0")
+	}
+	viabProfile, ok := result.Config.Profiles["viabilidade"]
+	if !ok {
+		t.Fatalf("esperava profile 'viabilidade', obteve perfis: %+v", result.Config.Profiles)
+	}
+	// Profile viabilidade deve conter postgres, redis, viabilidade-backend, viabilidade-frontend
+	profileStr := strings.Join(viabProfile, ",")
+	if !strings.Contains(profileStr, "postgres") || !strings.Contains(profileStr, "redis") ||
+		!strings.Contains(profileStr, "viabilidade-backend") || !strings.Contains(profileStr, "viabilidade-frontend") {
+		t.Fatalf("profile viabilidade incompleto: %v", viabProfile)
+	}
+}
+
+
 

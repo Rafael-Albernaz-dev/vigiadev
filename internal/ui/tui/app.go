@@ -182,13 +182,33 @@ type AppModel struct {
 	probes          map[string]probeStatus
 }
 
+// isDatabaseOrRawTCP identifica se a porta pertence a banco de dados ou protocolo TCP não-HTTP.
+func isDatabaseOrRawTCP(name string, port int) bool {
+	switch port {
+	case 5432, 5433, 5434, 6379, 3306, 27017, 5672:
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, dbKeyword := range []string{"postgres", "redis", "mysql", "mariadb", "mongo", "rabbit"} {
+		if strings.Contains(lower, dbKeyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// formatClickableURL formata uma URL como hiperlink de terminal via sequência ANSI OSC 8.
+func formatClickableURL(url, text string) string {
+	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text)
+}
+
 // SetToggleFunc atribui o callback para iniciar ou parar um serviço individualmente.
 func (m *AppModel) SetToggleFunc(fn func(service string) error) {
 	m.toggleFunc = fn
 }
 
-// NewAppModel instantiates the interactive TUI model.
-func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) *AppModel {
+// NewAppModel instantiates the interactive TUI model with initial service ports.
+func NewAppModel(projectName string, serviceNames []string, servicePorts map[string]int, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) *AppModel {
 	tabs := append([]string{"ALL"}, serviceNames...)
 	tabs = append(tabs, "METRICS")
 
@@ -197,9 +217,17 @@ func NewAppModel(projectName string, serviceNames []string, bus *domain.EventBus
 
 	logs["ALL"] = make([]string, 0)
 	for _, name := range serviceNames {
+		port := 0
+		if servicePorts != nil {
+			if p, ok := servicePorts[name]; ok {
+				port = p
+			}
+		}
 		cards[name] = &ServiceCardState{
-			Name:  name,
-			State: domain.StatePending,
+			Name:         name,
+			State:        domain.StatePending,
+			Port:         port,
+			OriginalPort: port,
 		}
 		logs[name] = make([]string, 0)
 	}
@@ -552,8 +580,12 @@ func (m *AppModel) renderMetricsDashboard() string {
 		}
 		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Network Port (TCP):"), valStyle.Render(portStr)))
 		if card.Port > 0 {
-			urlStr := fmt.Sprintf("http://localhost:%d", card.Port)
-			content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Service Web URL:"), valStyle.Render(urlStr)))
+			if isDatabaseOrRawTCP(card.Name, card.Port) {
+				content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Database / TCP:"), valStyle.Render(fmt.Sprintf("localhost:%d", card.Port))))
+			} else {
+				rawURL := fmt.Sprintf("http://localhost:%d", card.Port)
+				content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Service Web URL:"), valStyle.Render(formatClickableURL(rawURL, rawURL))))
+			}
 		}
 
 		// CPU Usage
@@ -652,13 +684,22 @@ func (m *AppModel) View() string {
 
 		portStr := "-"
 		if card.Port > 0 {
-			if card.IsRemapped {
-				portStr = fmt.Sprintf("http://localhost:%d➔:%d", card.OriginalPort, card.Port)
+			if isDatabaseOrRawTCP(card.Name, card.Port) {
+				if card.IsRemapped {
+					portStr = fmt.Sprintf(":%d➔:%d", card.OriginalPort, card.Port)
+				} else {
+					portStr = fmt.Sprintf(":%d", card.Port)
+				}
 			} else {
-				portStr = fmt.Sprintf("http://localhost:%d", card.Port)
+				targetURL := fmt.Sprintf("http://localhost:%d", card.Port)
+				displayText := targetURL
+				if card.IsRemapped {
+					displayText = fmt.Sprintf("http://localhost:%d➔:%d", card.OriginalPort, card.Port)
+				}
+				portStr = formatClickableURL(targetURL, displayText)
 			}
 		}
-		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(24).Render(portStr)
+		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(28).Render(portStr)
 
 		resStr := "-"
 		if card.CPUPercent > 0 || card.MemoryBytes > 0 {
@@ -762,7 +803,12 @@ func (m *AppModel) View() string {
 	if currentTab != "ALL" && currentTab != "METRICS" {
 		urlSnippet := ""
 		if card, ok := m.cards[currentTab]; ok && card.Port > 0 {
-			urlSnippet = fmt.Sprintf("  •  🌐 http://localhost:%d", card.Port)
+			if isDatabaseOrRawTCP(card.Name, card.Port) {
+				urlSnippet = fmt.Sprintf("  •  🔌 localhost:%d", card.Port)
+			} else {
+				rawURL := fmt.Sprintf("http://localhost:%d", card.Port)
+				urlSnippet = fmt.Sprintf("  •  🌐 %s", formatClickableURL(rawURL, rawURL))
+			}
 		}
 		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [r] Restart '%s'  •  [s] Start/Stop%s  •  [c] Clear  •  [q] Quit", currentTab, urlSnippet)
 	} else if currentTab == "METRICS" {
@@ -875,9 +921,17 @@ func (m *AppModel) renderDiagnostics() string {
 		detail := "Waiting for probe..."
 
 		if card != nil && card.Port > 0 {
-			target = fmt.Sprintf("http://localhost:%d", card.Port)
-			if card.IsRemapped {
-				target = fmt.Sprintf("http://localhost:%d (remap)", card.Port)
+			if isDatabaseOrRawTCP(card.Name, card.Port) {
+				target = fmt.Sprintf("localhost:%d", card.Port)
+				if card.IsRemapped {
+					target = fmt.Sprintf("localhost:%d (remap)", card.Port)
+				}
+			} else {
+				rawURL := fmt.Sprintf("http://localhost:%d", card.Port)
+				target = formatClickableURL(rawURL, rawURL)
+				if card.IsRemapped {
+					target = formatClickableURL(rawURL, fmt.Sprintf("%s (remap)", rawURL))
+				}
 			}
 		}
 
@@ -958,8 +1012,8 @@ func (m *AppModel) renderDiagnostics() string {
 }
 
 // RunTUI starts the Bubble Tea program with mouse tracking and event bus bridge.
-func RunTUI(ctx context.Context, projectName string, serviceNames []string, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) error {
-	model := NewAppModel(projectName, serviceNames, bus, cancel, restartFunc)
+func RunTUI(ctx context.Context, projectName string, serviceNames []string, servicePorts map[string]int, bus *domain.EventBus, cancel context.CancelFunc, restartFunc func(service string) error) error {
+	model := NewAppModel(projectName, serviceNames, servicePorts, bus, cancel, restartFunc)
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),

@@ -13,10 +13,11 @@
 
 - **⚡ Native Go Binary**: Standalone static binary (~12MB), zero runtime dependencies, instant boot (<2ms).
 - **🧭 Deterministic DAG Orchestration**: Resolves service dependencies via Kahn's topological sort algorithm, running independent services in concurrent execution waves.
-- **📦 Deep Monorepo & Modular Stack Detection**: Automatically discovers nested modular apps (`backend/apps/*`, `frontend/apps/*`, npm/pnpm/yarn/bun workspaces) with dedicated ports and execution directories (`dir:`).
+- **📦 Deep Monorepo & Modular Stack Detection**: Automatically discovers nested modular apps (`backend/apps/*`, `frontend/apps/*`, npm/pnpm/yarn/bun workspaces) with dedicated execution directories (`dir:`). Interspects real backend ports from Vite proxy configs, manifests, or source code, automatically wires DAG dependencies (`depends_on: [<module>-backend]`), and synthesizes declarative execution profiles.
 - **🛡️ Strict Safety & Teardown Model**: Never runs destructive commands (`docker compose down`, `kill -9`) without explicit policy. Tracks every PID, PGID, and Container ID in `.vigiadev/run.json` and stops only resources owned by the current session.
 - **🖥️ Interactive Charm.sh TUI**: Rich terminal interface powered by Bubble Tea, Lip Gloss, and Bubbles:
-  - Full clickable and navigable URLs (`http://localhost:<port>`).
+  - Native terminal clickable hyperlinks via **ANSI OSC 8** (`http://localhost:<port>`) supporting direct Ctrl+Click in modern terminals.
+  - Semantic port presentation: active web services display navigable hyperlinks, while databases and brokers display raw listening sockets (`:5432`, `:6379`).
   - Real-time log streaming with search/filter (`[/]`).
   - Live system resource telemetry (CPU %, RAM, Disk I/O).
   - Instant on-demand lifecycle controls: `[s]` to Start/Stop, `[r]` to Restart.

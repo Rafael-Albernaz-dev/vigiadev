@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,6 +90,34 @@ func (sd *StackDetector) Detect() (*DetectionResult, error) {
 		return nil, err
 	}
 	cfg.Tasks = tasks
+
+	// Sintetiza perfis declarativos caso haja múltiplos módulos identificados
+	moduleMap := make(map[string][]string)
+	for svcName := range cfg.Services {
+		if strings.HasSuffix(svcName, "-backend") {
+			mod := strings.TrimSuffix(svcName, "-backend")
+			moduleMap[mod] = append(moduleMap[mod], svcName)
+		} else if strings.HasSuffix(svcName, "-frontend") {
+			mod := strings.TrimSuffix(svcName, "-frontend")
+			moduleMap[mod] = append(moduleMap[mod], svcName)
+		}
+	}
+
+	if len(moduleMap) > 1 {
+		cfg.Profiles = make(map[string][]string)
+		var baseServices []string
+		for svcName := range composeServices {
+			baseServices = append(baseServices, svcName)
+		}
+		sort.Strings(baseServices)
+
+		for mod, svcs := range moduleMap {
+			sort.Strings(svcs)
+			profileList := append([]string{}, baseServices...)
+			profileList = append(profileList, svcs...)
+			cfg.Profiles[mod] = profileList
+		}
+	}
 
 	return &DetectionResult{
 		Config:  cfg,
@@ -607,6 +636,9 @@ func (sd *StackDetector) detectNestedMonorepoApps(usedPorts map[int]bool, allocP
 
 			port := scriptPort(scriptBody)
 			if port == 0 {
+				port = sd.inspectBackendAppPort(appName, clean)
+			}
+			if port == 0 {
 				port = allocPort(3000)
 			} else {
 				usedPorts[port] = true
@@ -693,7 +725,129 @@ func (sd *StackDetector) detectNestedMonorepoApps(usedPorts map[int]bool, allocP
 		}
 	}
 
+	// 3. Injeta dependência nos frontends para seus respectivos backends
+	for name, svc := range result.services {
+		if strings.HasSuffix(name, "-frontend") {
+			clean := strings.TrimSuffix(name, "-frontend")
+			backendName := clean + "-backend"
+			if _, ok := result.services[backendName]; ok {
+				hasDep := false
+				for _, d := range svc.DependsOn {
+					if d == backendName {
+						hasDep = true
+						break
+					}
+				}
+				if !hasDep {
+					svc.DependsOn = append(svc.DependsOn, backendName)
+					result.services[name] = svc
+				}
+			}
+		}
+	}
+
 	return result
+}
+
+var (
+	reViteProxyVar = regexp.MustCompile(`(?i)(?:backendPort|apiPort|proxyPort)\s*=\s*.*?([0-9]{4,5})`)
+	reViteTarget   = regexp.MustCompile("target\\s*:\\s*[`'\"]https?://(?:localhost|127\\.0\\.0\\.1):([0-9]{4,5})")
+	reReturnPort   = regexp.MustCompile(`return\s+([0-9]{4,5})\s*;`)
+	reFallbackPort = regexp.MustCompile(`\|\|\s*['"]?([0-9]{4,5})['"]?`)
+	reListenPort   = regexp.MustCompile(`\.listen\(\s*['"]?([0-9]{4,5})['"]?`)
+)
+
+func (sd *StackDetector) inspectBackendAppPort(appName, clean string) int {
+	// 1. Procura em manifestos JSON sob infra/ ou na raiz
+	var manifestPaths []string
+	_ = filepath.Walk(filepath.Join(sd.RootDir, "infra"), func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".json") {
+			manifestPaths = append(manifestPaths, path)
+		}
+		return nil
+	})
+	if fileExists(filepath.Join(sd.RootDir, "manifest.json")) {
+		manifestPaths = append(manifestPaths, filepath.Join(sd.RootDir, "manifest.json"))
+	}
+	for _, p := range manifestPaths {
+		if data, err := os.ReadFile(p); err == nil {
+			var doc struct {
+				Apps []struct {
+					ID   string `json:"id"`
+					Port int    `json:"port"`
+				} `json:"apps"`
+			}
+			if err := json.Unmarshal(data, &doc); err == nil {
+				for _, a := range doc.Apps {
+					if (a.ID == appName || a.ID == clean) && a.Port >= 1024 && a.Port <= 65535 {
+						return a.Port
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Procura em configs do frontend correspondente (ex: vite.config.* proxy target)
+	frontendDir := filepath.Join(sd.RootDir, "frontend", "apps")
+	for _, fApp := range []string{appName, clean, "atlas-" + clean} {
+		fDir := filepath.Join(frontendDir, fApp)
+		entries, err := os.ReadDir(fDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "vite.config.") {
+				if content, err := os.ReadFile(filepath.Join(fDir, e.Name())); err == nil {
+					str := string(content)
+					if m := reViteProxyVar.FindStringSubmatch(str); len(m) > 1 {
+						if p, err := strconv.Atoi(m[1]); err == nil && p >= 1024 && p <= 65535 {
+							return p
+						}
+					}
+					if m := reViteTarget.FindStringSubmatch(str); len(m) > 1 {
+						if p, err := strconv.Atoi(m[1]); err == nil && p >= 1024 && p <= 65535 {
+							return p
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Procura no próprio código do backend (backend/apps/<appName>/src/)
+	bSrcDir := filepath.Join(sd.RootDir, "backend", "apps", appName, "src")
+	var foundPort int
+	_ = filepath.Walk(bSrcDir, func(path string, info os.FileInfo, err error) error {
+		if foundPort > 0 {
+			return nil
+		}
+		if err == nil && !info.IsDir() && (strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".js")) {
+			if content, err := os.ReadFile(path); err == nil {
+				str := string(content)
+				if m := reReturnPort.FindStringSubmatch(str); len(m) > 1 {
+					if p, err := strconv.Atoi(m[1]); err == nil && p >= 1024 && p <= 65535 {
+						foundPort = p
+						return nil
+					}
+				}
+				if m := reFallbackPort.FindStringSubmatch(str); len(m) > 1 {
+					if p, err := strconv.Atoi(m[1]); err == nil && p >= 1024 && p <= 65535 {
+						foundPort = p
+						return nil
+					}
+				}
+				if m := reListenPort.FindStringSubmatch(str); len(m) > 1 {
+					if p, err := strconv.Atoi(m[1]); err == nil && p >= 1024 && p <= 65535 {
+						foundPort = p
+						return nil
+					}
+				}
+			}
+		}
+		return nil
+	})
+
+	return foundPort
 }
 
 // detectNodeJS inspeciona package.json e lockfiles.
