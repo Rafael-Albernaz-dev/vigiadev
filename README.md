@@ -18,7 +18,7 @@
 - **⚡ Native Go Binary**: Standalone static binary (~12MB), zero runtime dependencies, instant boot (<2ms).
 - **🧭 Deterministic DAG Orchestration**: Resolves service dependencies via Kahn's topological sort algorithm, running independent services in concurrent execution waves.
 - **📦 Deep Monorepo & Modular Stack Detection**: Automatically discovers nested modular apps (`backend/apps/*`, `frontend/apps/*`, npm/pnpm/yarn/bun workspaces) with dedicated execution directories (`dir:`). Interspects real backend ports from Vite proxy configs, manifests, or source code, automatically wires DAG dependencies (`depends_on: [<module>-backend]`), and synthesizes declarative execution profiles.
-- **🛡️ Strict Safety & Teardown Model**: Never runs destructive commands (`docker compose down`, `kill -9`) without explicit policy. Tracks every PID, PGID, and Container ID in `.vigiadev/run.json` and stops only resources owned by the current session.
+- **🛡️ Strict Safety & Teardown Model**: Never runs destructive commands (`docker compose down`, `kill -9`) without explicit policy. Tracks every PID, PGID, working directory, and Container ID in `.vigiadev/run.json` with immediate spawn persistence. Automatically cleans up stale/orphaned processes across subdirectories on `vigiadev up` while preserving external workloads.
 - **🖥️ Interactive Charm.sh TUI**: Rich terminal interface powered by Bubble Tea, Lip Gloss, and Bubbles:
   - Native terminal clickable hyperlinks via **ANSI OSC 8** (`http://localhost:<port>`) supporting direct Ctrl+Click in modern terminals.
   - Semantic port presentation: active web services display navigable hyperlinks, while databases and brokers display raw listening sockets (`:5432`, `:6379`).
@@ -220,7 +220,7 @@ tasks:
 
 vigiaDev follows the principle of **strict ownership**:
 1. **Never destructive by default**: Does not call `docker compose down` or kill external processes unless explicitly instructed via policies or `--kill-ports`.
-2. **Session Ledger (`.vigiadev/run.json`)**: Every spawned process group (`PGID`), PID, and started Docker Container ID is atomically recorded.
+2. **Session Ledger (`.vigiadev/run.json`)**: Every spawned process group (`PGID`), PID, working directory (`dir`), and started Docker Container ID is recorded immediately on spawn.
 3. **Surgical Teardown**: Shutdown targets **strictly** the resources recorded in the session ledger, ensuring databases, daemons, or sibling projects remain untouched.
 4. **Stale Lock Recovery**: `.vigiadev/vigiadev.lock` uses PID-liveness validation to safely clean up orphaned locks if an earlier session crashed.
 

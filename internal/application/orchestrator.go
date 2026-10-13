@@ -534,7 +534,9 @@ func (o *Orchestrator) startService(ctx context.Context, name string, svc domain
 		PID:  info.PID,
 		PGID: info.PGID,
 		Port: assignedPort,
+		Dir:  workDir,
 	}
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
 	o.mu.Unlock()
 
 	var probeLatency time.Duration
@@ -652,6 +654,7 @@ func (o *Orchestrator) startComposeService(ctx context.Context, name string, svc
 		IsContainer: true,
 	}
 	o.manifest.Containers = append(o.manifest.Containers, info.ID)
+	_ = manifest.WriteManifest(o.WorkDir, o.manifest)
 	o.mu.Unlock()
 
 	var probeLatency time.Duration

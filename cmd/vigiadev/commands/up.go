@@ -309,6 +309,22 @@ func PreflightPorts(cfg *domain.VigiaConfig, in io.Reader, out io.Writer, intera
 	return remaps, nil
 }
 
+func isWithinDir(target, base string) bool {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = filepath.Clean(base)
+	}
+	realTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		realTarget = filepath.Clean(target)
+	}
+	rel, err := filepath.Rel(realBase, realTarget)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
+}
+
 // ReapOrphanedProcesses removes only local PIDs recorded by a stale run of this project.
 func ReapOrphanedProcesses(workDir, projectName string) error {
 	m, err := manifest.ReadManifest(workDir)
@@ -344,13 +360,18 @@ func ReapOrphanedProcesses(workDir, projectName string) error {
 			return fmt.Errorf("inspect orphan %q: %w", name, err)
 		}
 		group, err := syscall.Getpgid(svc.PID)
-		if err != nil || group != svc.PGID || filepath.Clean(cwd) != filepath.Clean(workDir) {
+		dirMatches := isWithinDir(cwd, workDir) || (svc.Dir != "" && isWithinDir(cwd, svc.Dir))
+		if err != nil || group != svc.PGID || !dirMatches {
 			return fmt.Errorf("refusing to terminate PID %d: project or process group no longer matches", svc.PID)
 		}
 		if err := ports.KillProcessByPID(svc.PID, 500*time.Millisecond); err != nil {
 			return fmt.Errorf("reap orphan %q: %w", name, err)
 		}
+		if svc.PGID > 0 {
+			_ = syscall.Kill(-svc.PGID, syscall.SIGKILL)
+		}
 	}
+	_ = manifest.ReleaseLock(workDir)
 	return manifest.RemoveManifest(workDir)
 }
 

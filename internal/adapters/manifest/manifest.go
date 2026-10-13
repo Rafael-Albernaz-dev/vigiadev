@@ -25,6 +25,7 @@ type ServiceManifest struct {
 	PID         int    `json:"pid,omitempty"`
 	PGID        int    `json:"pgid,omitempty"`
 	Port        int    `json:"port,omitempty"`
+	Dir         string `json:"dir,omitempty"`
 	ContainerID string `json:"container_id,omitempty"`
 	IsContainer bool   `json:"is_container,omitempty"`
 }

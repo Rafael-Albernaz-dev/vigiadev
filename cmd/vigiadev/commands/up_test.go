@@ -166,6 +166,87 @@ func TestUp_ReapOrphanedProcesses(t *testing.T) {
 	}
 }
 
+func TestUp_ReapOrphanedProcesses_Subdirectory(t *testing.T) {
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "backend")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPortConflictListenerHelper$")
+	cmd.Dir = subDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "VIGIA_CONFLICT_HELPER=1", "PORT=0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.RunManifest{RunID: "old-run-sub", ProjectName: "test-sub", Services: map[string]manifest.ServiceManifest{
+		"backend": {Name: "backend", PID: cmd.Process.Pid, PGID: cmd.Process.Pid, Port: port, Dir: subDir},
+	}}
+	if err := manifest.WriteManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := commands.ReapOrphanedProcesses(dir, "test-sub"); err != nil {
+		t.Fatalf("failed to reap orphan in subdirectory: %v", err)
+	}
+	if !ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("orphaned listener in subdirectory remains active")
+	}
+	if _, err := manifest.ReadManifest(dir); !os.IsNotExist(err) {
+		t.Fatalf("stale manifest remains: %v", err)
+	}
+}
+
+func TestUp_ReapOrphanedProcesses_RejectsOutsideProject(t *testing.T) {
+	dir := t.TempDir()
+	outsideDir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPortConflictListenerHelper$")
+	cmd.Dir = outsideDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "VIGIA_CONFLICT_HELPER=1", "PORT=0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.RunManifest{RunID: "old-run-outside", ProjectName: "test-out", Services: map[string]manifest.ServiceManifest{
+		"ext": {Name: "ext", PID: cmd.Process.Pid, PGID: cmd.Process.Pid, Port: port},
+	}}
+	if err := manifest.WriteManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	err = commands.ReapOrphanedProcesses(dir, "test-out")
+	if err == nil || !strings.Contains(err.Error(), "refusing to terminate PID") {
+		t.Fatalf("expected refusal to terminate external process, got: %v", err)
+	}
+	if ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("external listener was unexpectedly terminated")
+	}
+}
+
 func TestUp_KillPortsFlag(t *testing.T) {
 	for _, tc := range []struct {
 		name, input                        string

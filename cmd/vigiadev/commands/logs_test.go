@@ -6,9 +6,27 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
 
 func writeLog(t *testing.T, dir, name, body string) string {
 	t.Helper()
@@ -49,7 +67,7 @@ func TestLogs_FilterService(t *testing.T) {
 func TestLogs_Follow(t *testing.T) {
 	path := writeLog(t, t.TempDir(), "api.log", "first\n")
 	ctx, cancel := context.WithCancel(context.Background())
-	var out bytes.Buffer
+	var out safeBuffer
 	done := make(chan error, 1)
 	go func() { done <- streamLogFile(ctx, path, "api", 1, true, false, &out) }()
 	deadline := time.Now().Add(time.Second)
