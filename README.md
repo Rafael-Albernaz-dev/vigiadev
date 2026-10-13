@@ -1,11 +1,15 @@
 # vigiaDev 🛡️⚡
 
+[![Release](https://img.shields.io/badge/version-v1.0.0-blue.svg)](https://github.com/Rafael-Albernaz-dev/vigiadev/releases)
 [![Go Version](https://img.shields.io/badge/go-%3E%3D1.22-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/Rafael-Albernaz-dev/vigiadev/actions/workflows/ci.yml/badge.svg)](https://github.com/Rafael-Albernaz-dev/vigiadev/actions)
 
 > **Fast, deterministic, and safe local development environment orchestrator.**
 > Native Go CLI with sub-millisecond boot, Kahn DAG dependency scheduling, deep monorepo auto-detection, Docker Compose integration, and an interactive Charm.sh TUI.
+> 
+> 📌 **Status: v1.0.0 (Feature-Complete & Stable)**  
+> vigiaDev is in General Availability (v1.0.0). The core architecture and feature set are frozen and validated for production monorepo environments. Going forward, development is strictly focused on stability, reliability, and bug fixes.
 
 ---
 
