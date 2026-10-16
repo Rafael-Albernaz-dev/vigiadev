@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -90,6 +91,41 @@ func RemoveManifest(workDir string) error {
 	return err
 }
 
+// IsPIDAlive verifica se um PID existe na tabela de processos do sistema operacional e não está em estado zumbi.
+func IsPIDAlive(pid int) bool {
+	if pid <= 1 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+	if statData, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); readErr == nil {
+		s := string(statData)
+		if idx := strings.LastIndex(s, ")"); idx != -1 && idx+2 < len(s) {
+			state := s[idx+2]
+			if state == 'Z' || state == 'X' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ReadLockPID lê o PID gravado em .vigiadev/vigiadev.lock e informa se o processo ainda está ativo.
+func ReadLockPID(workDir string) (int, bool) {
+	lockPath := filepath.Join(workDir, VigiaDir, LockFile)
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return 0, false
+	}
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+	if parseErr != nil || pid <= 1 {
+		return 0, false
+	}
+	return pid, IsPIDAlive(pid)
+}
+
 // AcquireLock tenta obter a trava de execução exclusiva em .vigiadev/vigiadev.lock.
 // Implementa recuperação determinística de trava órfã (stale lock).
 func AcquireLock(workDir string) error {
@@ -101,18 +137,8 @@ func AcquireLock(workDir string) error {
 	lockPath := filepath.Join(dir, LockFile)
 
 	// Se o arquivo de lock já existir, verifica a saúde do processo que o criou
-	if data, err := os.ReadFile(lockPath); err == nil {
-		pidStr := string(data)
-		pid, parseErr := strconv.Atoi(pidStr)
-		if parseErr == nil && pid > 0 {
-			// Sinal 0 apenas verifica se o processo existe na tabela do SO
-			err := syscall.Kill(pid, 0)
-			if err == nil || err == syscall.EPERM {
-				// Processo ainda está vivo e rodando!
-				return fmt.Errorf("%w: processo com PID %d ainda está ativo", domain.ErrSessionLocked, pid)
-			}
-		}
-		// Se chegamos aqui, o processo anterior morreu abruptamente -> Lock órfão recuperado!
+	if pid, alive := ReadLockPID(workDir); alive {
+		return fmt.Errorf("%w: processo com PID %d ainda está ativo", domain.ErrSessionLocked, pid)
 	}
 
 	currentPID := strconv.Itoa(os.Getpid())

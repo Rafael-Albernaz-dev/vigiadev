@@ -174,6 +174,7 @@ type AppModel struct {
 	cancel          context.CancelFunc
 	restartFunc     func(service string) error
 	toggleFunc      func(service string) error
+	startAllFunc    func() error
 	statusMsg       string
 	isFiltering     bool
 	filterQuery     string
@@ -205,6 +206,11 @@ func formatClickableURL(url, text string) string {
 // SetToggleFunc atribui o callback para iniciar ou parar um serviço individualmente.
 func (m *AppModel) SetToggleFunc(fn func(service string) error) {
 	m.toggleFunc = fn
+}
+
+// SetStartAllFunc atribui o callback para iniciar todos os serviços em ordem de dependência.
+func (m *AppModel) SetStartAllFunc(fn func() error) {
+	m.startAllFunc = fn
 }
 
 // NewAppModel instantiates the interactive TUI model with initial service ports.
@@ -260,8 +266,24 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.diagnosticsOpen {
 			switch msg.String() {
-			case "d", "esc":
+			case "d", "D", "esc":
 				m.diagnosticsOpen = false
+				return m, nil
+			case "r", "R":
+				m.diagnosticsOpen = false
+				currentTab := m.tabs[m.activeTab]
+				if currentTab != "ALL" && currentTab != "METRICS" && m.restartFunc != nil {
+					m.statusMsg = fmt.Sprintf("Restarting service '%s'...", currentTab)
+					svc := currentTab
+					fn := m.restartFunc
+					return m, func() tea.Msg {
+						err := fn(svc)
+						return serviceOperationResultMsg{service: svc, op: "restart", err: err}
+					}
+				} else if currentTab == "ALL" || currentTab == "METRICS" {
+					m.statusMsg = "Select a specific service tab (Tab/Click) to restart"
+					return m, nil
+				}
 			}
 			return m, nil
 		}
@@ -298,12 +320,12 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "q", "ctrl+c":
+		case "q", "Q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
-		case "d":
+		case "d", "D":
 			m.diagnosticsOpen = true
 			m.doctorInfo = checkSystemPrereqs()
 			return m, nil
@@ -330,7 +352,17 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = (m.activeTab - 1 + len(m.tabs)) % len(m.tabs)
 			m.syncViewport()
 
-		case "r":
+		case "a", "A":
+			if m.startAllFunc != nil {
+				m.statusMsg = "Starting all services in dependency order..."
+				fn := m.startAllFunc
+				cmds = append(cmds, func() tea.Msg {
+					err := fn()
+					return serviceOperationResultMsg{service: "ALL", op: "start_all", err: err}
+				})
+			}
+
+		case "r", "R":
 			currentTab := m.tabs[m.activeTab]
 			if currentTab != "ALL" && currentTab != "METRICS" && m.restartFunc != nil {
 				m.statusMsg = fmt.Sprintf("Restarting service '%s'...", currentTab)
@@ -340,9 +372,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					err := fn(svc)
 					return serviceOperationResultMsg{service: svc, op: "restart", err: err}
 				})
+			} else if currentTab == "ALL" || currentTab == "METRICS" {
+				m.statusMsg = "Select a specific service tab (Tab/Click) to restart"
 			}
 
-		case "s":
+		case "s", "S":
 			currentTab := m.tabs[m.activeTab]
 			if currentTab != "ALL" && currentTab != "METRICS" && m.toggleFunc != nil {
 				m.statusMsg = fmt.Sprintf("Toggling service '%s'...", currentTab)
@@ -352,9 +386,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					err := fn(svc)
 					return serviceOperationResultMsg{service: svc, op: "toggle", err: err}
 				})
+			} else if currentTab == "ALL" || currentTab == "METRICS" {
+				m.statusMsg = "Select a specific service tab (Tab/Click) to start/stop"
 			}
 
-		case "c":
+		case "c", "C":
 			currentTab := m.tabs[m.activeTab]
 			if currentTab != "METRICS" {
 				m.logs[currentTab] = make([]string, 0)
@@ -492,7 +528,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("Error on %s for '%s': %v", msg.op, msg.service, msg.err)
 		} else {
-			m.statusMsg = fmt.Sprintf("Service '%s': %s completed", msg.service, msg.op)
+			if msg.op == "start_all" {
+				m.statusMsg = "All services started successfully."
+			} else {
+				m.statusMsg = fmt.Sprintf("Service '%s': %s completed", msg.service, msg.op)
+			}
 		}
 	}
 
@@ -810,11 +850,11 @@ func (m *AppModel) View() string {
 				urlSnippet = fmt.Sprintf("  •  🌐 %s", formatClickableURL(rawURL, rawURL))
 			}
 		}
-		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [r] Restart '%s'  •  [s] Start/Stop%s  •  [c] Clear  •  [q] Quit", currentTab, urlSnippet)
+		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [a] Start All  •  [r] Restart '%s'  •  [s] Start/Stop%s  •  [c] Clear  •  [q] Quit", currentTab, urlSnippet)
 	} else if currentTab == "METRICS" {
 		footerText = "[Tab/Click] Switch  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
 	} else {
-		footerText = "[Tab/Click] Switch  •  [/] Filter  •  [1-9] Quick Jump  •  [Scroll/Arrows] Scroll  •  [q] Quit"
+		footerText = "[Tab/Click] Switch  •  [/] Filter  •  [a] Start All  •  [1-9] Quick Jump  •  [Scroll/Arrows] Scroll  •  [q] Quit"
 	}
 
 	if m.filterQuery != "" && currentTab != "METRICS" {

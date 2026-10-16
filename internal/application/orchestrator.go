@@ -291,6 +291,24 @@ func (o *Orchestrator) waitUntilHealthy(ctx context.Context, service string, cfg
 		}
 		o.Bus.Publish(probe)
 		if err == nil {
+			if o.Supervisor != nil && o.Supervisor.HasProcess(service) {
+				if exited, isPortConflict, diag := o.Supervisor.DiagnoseExit(service); exited {
+					if isPortConflict {
+						return 0, fmt.Errorf("service '%s' failed on startup due to port conflict: %s (run 'vigiadev --kill-ports')", service, diag)
+					}
+					return 0, fmt.Errorf("service '%s' failed on startup: %s", service, diag)
+				}
+				if !o.Supervisor.IsProcessRunning(service) {
+					time.Sleep(50 * time.Millisecond)
+					if exited, isPortConflict, diag := o.Supervisor.DiagnoseExit(service); exited {
+						if isPortConflict {
+							return 0, fmt.Errorf("service '%s' failed on startup due to port conflict: %s (run 'vigiadev --kill-ports')", service, diag)
+						}
+						return 0, fmt.Errorf("service '%s' failed on startup: %s", service, diag)
+					}
+					return 0, fmt.Errorf("service '%s' terminated prematurely", service)
+				}
+			}
 			return latency, nil
 		}
 		lastErr = err
@@ -919,6 +937,16 @@ func (o *Orchestrator) ToggleService(ctx context.Context, name string) error {
 	return o.StartService(ctx, name)
 }
 
+// StartAllServices inicia todos os serviços configurados respeitando as ondas de dependência do DAG.
+func (o *Orchestrator) StartAllServices(ctx context.Context) error {
+	o.Bus.Publish(domain.LogLineProduced{
+		BaseEvent: domain.NewBaseEvent(),
+		Service:   "ALL",
+		Line:      "[vigiadev] Starting all services in DAG dependency order...",
+		IsError:   false,
+	})
+	return o.EnsureServicesHealthy(ctx, o.DAG.LinearOrder)
+}
 
 // EnsureServicesHealthy garante que todos os serviços informados (e suas dependências transitivas) estejam rodando e saudáveis.
 func (o *Orchestrator) EnsureServicesHealthy(ctx context.Context, serviceNames []string) error {

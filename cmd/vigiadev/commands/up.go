@@ -32,11 +32,13 @@ var (
 	killPorts   bool
 	forceUp     bool
 	profileFlag string
+	allFlag     bool
 )
 
 var upCmd = &cobra.Command{
-	Use:   "up [services...]",
-	Short: "Start and supervise local environment services with interactive TUI",
+	Use:          "up [services...]",
+	Short:        "Start and supervise local environment services with interactive TUI",
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -84,6 +86,8 @@ var upCmd = &cobra.Command{
 			}
 		}
 
+		projectRoot := filepath.Dir(cfgPath)
+
 		cfg, err := config.LoadConfig(cfgPath)
 		if err != nil {
 			return fmt.Errorf("failed to load configuration: %w", err)
@@ -91,12 +95,16 @@ var upCmd = &cobra.Command{
 		input, isFile := cmd.InOrStdin().(*os.File)
 		interactive := isFile && isatty.IsTerminal(input.Fd()) && os.Getenv("CI") == ""
 
-		cfg, err = ResolveProfilesAndServices(cfg, profileFlag, args, cmd.InOrStdin(), cmd.OutOrStdout(), interactive && !forceUp)
+		proceed, err := HandleOrReapPriorSession(projectRoot, cfg.ProjectName, cmd.InOrStdin(), cmd.OutOrStdout(), interactive, forceUp)
 		if err != nil {
 			return err
 		}
+		if !proceed {
+			return nil
+		}
 
-		if err := ReapOrphanedProcesses(cwd, cfg.ProjectName); err != nil {
+		cfg, err = ResolveProfilesAndServicesWithAll(cfg, profileFlag, args, cmd.InOrStdin(), cmd.OutOrStdout(), interactive && !forceUp, allFlag)
+		if err != nil {
 			return err
 		}
 
@@ -106,7 +114,7 @@ var upCmd = &cobra.Command{
 		}
 		bus := domain.NewEventBus()
 
-		orch, err := application.NewOrchestrator(cfg, cwd, bus)
+		orch, err := application.NewOrchestrator(cfg, projectRoot, bus)
 		if err != nil {
 			return fmt.Errorf("failed to initialize orchestrator: %w", err)
 		}
@@ -170,8 +178,13 @@ var upCmd = &cobra.Command{
 			servicePorts[remap.Service] = remap.TargetPort
 		}
 
+		startAllFunc := func() error {
+			return orch.StartAllServices(ctx)
+		}
+
 		appModel := tui.NewAppModel(cfg.ProjectName, serviceNames, servicePorts, bus, cancel, restartFunc)
 		appModel.SetToggleFunc(toggleFunc)
+		appModel.SetStartAllFunc(startAllFunc)
 		program := tea.NewProgram(appModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		bus.Subscribe(func(event domain.Event) { program.Send(event) })
 		go func() { orchErrChan <- orch.Run(ctx) }()
@@ -199,6 +212,9 @@ func init() {
 	upCmd.Flags().BoolVarP(&killPorts, "kill-ports", "k", false, "Resolve port conflicts by terminating listeners (confirmation in interactive terminals)")
 	upCmd.Flags().BoolVarP(&forceUp, "force", "f", false, "Authorize configured port kills without prompting")
 	upCmd.Flags().StringVarP(&profileFlag, "profile", "p", "", "Execution profile to run (filters services)")
+	upCmd.Flags().BoolVarP(&allFlag, "all", "a", false, "Start all services declared in configuration (bypasses profile prompt)")
+	upCmd.Flags().BoolVarP(&allFlag, "ALL", "A", false, "Start all services declared in configuration (bypasses profile prompt)")
+	_ = upCmd.Flags().MarkHidden("ALL")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -325,10 +341,75 @@ func isWithinDir(target, base string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
 
+// readSingleLine reads one line byte-by-byte without lookahead buffering so multiple sequential prompts can share io.Reader.
+func readSingleLine(in io.Reader) (string, bool) {
+	if in == nil {
+		return "", false
+	}
+	var buf []byte
+	b := make([]byte, 1)
+	for {
+		n, err := in.Read(b)
+		if n > 0 {
+			if b[0] == '\n' {
+				return strings.TrimRight(string(buf), "\r"), true
+			}
+			buf = append(buf, b[0])
+		}
+		if err != nil {
+			if len(buf) > 0 {
+				return strings.TrimRight(string(buf), "\r"), true
+			}
+			return "", false
+		}
+	}
+}
+
+// HandleOrReapPriorSession checks whether an active vigiadev session is already running BEFORE prompting for profiles.
+// If an active session exists:
+//   - With force=true: automatically stops the active session and proceeds.
+//   - With interactive=true: warns the user and prompts whether to stop and restart it [y/N].
+//   - Otherwise: returns a clear actionable error explaining how to inspect (`vigiadev status`) or stop (`vigiadev down`) it.
+func HandleOrReapPriorSession(workDir, projectName string, in io.Reader, out io.Writer, interactive, force bool) (bool, error) {
+	if out == nil {
+		out = io.Discard
+	}
+	ownerPID, alive := manifest.ReadLockPID(workDir)
+	if alive && ownerPID > 1 {
+		if force {
+			fmt.Fprintf(out, "⚠️ Active vigiadev session detected (PID %d). Stopping existing session (--force)...\n", ownerPID)
+			if err := StopSession(workDir); err != nil {
+				return false, fmt.Errorf("failed to stop active session (PID %d): %w", ownerPID, err)
+			}
+			return true, nil
+		}
+		if interactive {
+			fmt.Fprintf(out, "⚠️ An active vigiadev session (PID %d) is already running for project %q.\n", ownerPID, projectName)
+			fmt.Fprint(out, "Stop existing session and restart now? [y/N]: ")
+			line, ok := readSingleLine(in)
+			choice := strings.ToLower(strings.TrimSpace(line))
+			if ok && (choice == "y" || choice == "yes" || choice == "s" || choice == "sim") {
+				if err := StopSession(workDir); err != nil {
+					return false, fmt.Errorf("failed to stop active session (PID %d): %w", ownerPID, err)
+				}
+				return true, nil
+			}
+			fmt.Fprintln(out, "Operation cancelled. Run 'vigiadev status' to inspect or 'vigiadev down' to stop the active session.")
+			return false, nil
+		}
+		return false, fmt.Errorf("prior vigiadev session with PID %d is still active (run 'vigiadev status' to inspect, 'vigiadev down' to stop it, or 'vigiadev up --force' to replace it)", ownerPID)
+	}
+	if err := ReapOrphanedProcesses(workDir, projectName); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ReapOrphanedProcesses removes only local PIDs recorded by a stale run of this project.
 func ReapOrphanedProcesses(workDir, projectName string) error {
 	m, err := manifest.ReadManifest(workDir)
 	if errors.Is(err, os.ErrNotExist) {
+		_ = manifest.ReleaseLock(workDir)
 		return nil
 	}
 	if err != nil {
@@ -337,16 +418,9 @@ func ReapOrphanedProcesses(workDir, projectName string) error {
 	if m.ProjectName != projectName || m.RunID == "" {
 		return fmt.Errorf("prior run manifest does not match this project")
 	}
-	lock, err := os.ReadFile(filepath.Join(workDir, manifest.VigiaDir, manifest.LockFile))
-	if err == nil {
-		var owner int
-		if _, scanErr := fmt.Sscanf(string(lock), "%d", &owner); scanErr == nil && owner > 1 {
-			if err := syscall.Kill(owner, 0); err == nil || errors.Is(err, syscall.EPERM) {
-				return fmt.Errorf("prior vigiadev session with PID %d is still active", owner)
-			}
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+	owner, alive := manifest.ReadLockPID(workDir)
+	if alive && owner > 1 {
+		return fmt.Errorf("prior vigiadev session with PID %d is still active", owner)
 	}
 	for name, svc := range m.Services {
 		if svc.IsContainer || svc.PID <= 1 || svc.PGID != svc.PID {
@@ -437,9 +511,8 @@ func PromptProfileSelection(cfg *domain.VigiaConfig, in io.Reader, out io.Writer
 	fmt.Fprintln(out, "  [A] All services (default)")
 	fmt.Fprint(out, "Select [A]: ")
 
-	scanner := bufio.NewScanner(in)
-	if scanner.Scan() {
-		choice := strings.TrimSpace(scanner.Text())
+	if line, ok := readSingleLine(in); ok {
+		choice := strings.TrimSpace(line)
 		if choice == "" || strings.EqualFold(choice, "a") || strings.EqualFold(choice, "all") {
 			return "all", nil
 		}
@@ -458,6 +531,42 @@ func PromptProfileSelection(cfg *domain.VigiaConfig, in io.Reader, out io.Writer
 
 // ResolveProfilesAndServices aplica as regras de filtragem por profile e/ou argumentos posicionais.
 func ResolveProfilesAndServices(cfg *domain.VigiaConfig, profile string, args []string, in io.Reader, out io.Writer, interactive bool) (*domain.VigiaConfig, error) {
+	return ResolveProfilesAndServicesWithAll(cfg, profile, args, in, out, interactive, false)
+}
+
+// ResolveProfilesAndServicesWithAll aplica as regras de filtragem considerando a opção allServices (flag -a/-A/--all).
+func ResolveProfilesAndServicesWithAll(cfg *domain.VigiaConfig, profile string, args []string, in io.Reader, out io.Writer, interactive bool, allServices bool) (*domain.VigiaConfig, error) {
+	if allServices {
+		var filteredArgs []string
+		for _, arg := range args {
+			if !strings.EqualFold(arg, "all") && arg != "-a" && arg != "-A" && arg != "--all" {
+				filteredArgs = append(filteredArgs, arg)
+			}
+		}
+		if len(filteredArgs) > 0 {
+			return FilterServices(cfg, filteredArgs)
+		}
+		return cfg, nil
+	}
+
+	if len(args) > 0 {
+		var filteredArgs []string
+		hasAllArg := false
+		for _, arg := range args {
+			if strings.EqualFold(arg, "all") || arg == "-a" || arg == "-A" || arg == "--all" {
+				hasAllArg = true
+			} else {
+				filteredArgs = append(filteredArgs, arg)
+			}
+		}
+		if hasAllArg && len(filteredArgs) == 0 {
+			return cfg, nil
+		}
+		if len(filteredArgs) > 0 {
+			return FilterServices(cfg, filteredArgs)
+		}
+	}
+
 	if profile != "" {
 		svcs, exists := cfg.Profiles[profile]
 		if !exists {
@@ -473,10 +582,6 @@ func ResolveProfilesAndServices(cfg *domain.VigiaConfig, profile string, args []
 			targets = append(targets, args...)
 		}
 		return FilterServices(cfg, targets)
-	}
-
-	if len(args) > 0 {
-		return FilterServices(cfg, args)
 	}
 
 	if len(cfg.Profiles) > 0 && interactive {

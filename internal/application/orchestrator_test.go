@@ -883,16 +883,23 @@ func TestOrchestrator_ReuseOccupiedService(t *testing.T) {
 
 func TestOrchestrator_FailFast_PortConflictCrash(t *testing.T) {
 	tempDir := t.TempDir()
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+
 	cfg := &domain.VigiaConfig{
 		Version:     1,
 		ProjectName: "failfast-test",
 		Services: map[string]domain.ServiceConfig{
 			"crashing-api": {
-				Command: []string{"sh", "-c", "echo 'Error: listen EADDRINUSE :::3000' >&2; exit 1"},
-				Ports:   []int{3000},
+				Command: []string{"sh", "-c", fmt.Sprintf("echo 'Error: listen EADDRINUSE :::%d' >&2; exit 1", port)},
+				Ports:   []int{port},
 				HealthCheck: &domain.HealthCheckConfig{
 					Type: domain.HealthCheckTCP,
-					Port: 3000,
+					Port: port,
 				},
 			},
 		},

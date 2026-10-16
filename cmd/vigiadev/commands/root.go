@@ -19,6 +19,16 @@ func Execute() error {
 	return rootCmd.Execute()
 }
 
+// GetRootCmd retorna a referência do comando raiz configurado.
+func GetRootCmd() *cobra.Command {
+	return rootCmd
+}
+
+// NewRootCommand retorna o comando raiz com todos os subcomandos registrados.
+func NewRootCommand() *cobra.Command {
+	return rootCmd
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (e.g. vigiadev.yaml)")
 }

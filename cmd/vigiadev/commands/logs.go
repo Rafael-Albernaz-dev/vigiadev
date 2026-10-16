@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/spf13/cobra"
 )
 
@@ -33,7 +34,24 @@ var logsCmd = &cobra.Command{
 		if filepath.Base(service) != service || service == "." || service == ".." {
 			return fmt.Errorf("invalid service name %q", service)
 		}
-		path := filepath.Join(cwd, ".vigiadev", "logs", service+".log")
+		targetDir := cwd
+		if cfgPath, err := config.FindConfigFile(cwd, cfgFile); err == nil {
+			targetDir = filepath.Dir(cfgPath)
+		} else {
+			curr := filepath.Clean(cwd)
+			for {
+				if _, statErr := os.Stat(filepath.Join(curr, ".vigiadev", "logs")); statErr == nil {
+					targetDir = curr
+					break
+				}
+				parent := filepath.Dir(curr)
+				if parent == curr {
+					break
+				}
+				curr = parent
+			}
+		}
+		path := filepath.Join(targetDir, ".vigiadev", "logs", service+".log")
 		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 		return streamLogFile(ctx, path, service, logsTail, logsFollow, logsTimestamps, cmd.OutOrStdout())

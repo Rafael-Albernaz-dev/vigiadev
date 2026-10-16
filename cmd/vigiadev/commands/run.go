@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -87,7 +88,8 @@ var runCmd = &cobra.Command{
 		}
 
 		bus := domain.NewEventBus()
-		orch, err := application.NewOrchestrator(cfg, cwd, bus)
+		projectRoot := filepath.Dir(cfgPath)
+		orch, err := application.NewOrchestrator(cfg, projectRoot, bus)
 		if err != nil {
 			return fmt.Errorf("failed to initialize orchestrator: %w", err)
 		}

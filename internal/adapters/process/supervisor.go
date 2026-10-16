@@ -213,6 +213,14 @@ func (s *Supervisor) ProcessStatus(name string) (isRunning bool, exitCode int, r
 	}
 }
 
+// HasProcess verifica se o processo foi iniciado e está sob custódia do supervisor.
+func (s *Supervisor) HasProcess(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.processes[name]
+	return exists
+}
+
 // IsProcessRunning verifica se o processo existe e está ativo.
 func (s *Supervisor) IsProcessRunning(name string) bool {
 	running, _, _ := s.ProcessStatus(name)

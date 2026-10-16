@@ -28,23 +28,44 @@ var PrecedenceFiles = []string{
 
 // FindConfigFile busca o arquivo de configuração no diretório informado seguindo a ordem de precedência.
 // Se explicitPath for fornecido via flag (--config), ele terá prioridade absoluta.
+// Caso a busca no diretório base não encontre um arquivo de configuração, ela sobe a árvore
+// recursivamente em busca do arquivo raiz do projeto (suporte a monolitos modulares e subdiretórios).
 func FindConfigFile(baseDir string, explicitPath string) (string, error) {
 	if explicitPath != "" {
 		resolved := explicitPath
 		if !filepath.IsAbs(resolved) {
 			resolved = filepath.Join(baseDir, explicitPath)
 		}
-		if _, err := os.Stat(resolved); err != nil {
+		fi, err := os.Stat(resolved)
+		if err != nil {
 			return "", fmt.Errorf("%w: arquivo explicitamente passado não existe: %s", ErrConfigNotFound, explicitPath)
+		}
+		if fi.IsDir() {
+			for _, name := range PrecedenceFiles {
+				candidate := filepath.Join(resolved, name)
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate, nil
+				}
+			}
+			return "", fmt.Errorf("%w: nenhum arquivo de configuração (%s) encontrado no diretório: %s", ErrConfigNotFound, strings.Join(PrecedenceFiles, ", "), explicitPath)
 		}
 		return resolved, nil
 	}
 
-	for _, name := range PrecedenceFiles {
-		candidate := filepath.Join(baseDir, name)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
+	curr := filepath.Clean(baseDir)
+	for {
+		for _, name := range PrecedenceFiles {
+			candidate := filepath.Join(curr, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, nil
+			}
 		}
+
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
 	}
 
 	return "", ErrConfigNotFound

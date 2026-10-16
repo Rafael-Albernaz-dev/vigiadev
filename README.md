@@ -24,9 +24,11 @@
   - Semantic port presentation: active web services display navigable hyperlinks, while databases and brokers display raw listening sockets (`:5432`, `:6379`).
   - Real-time log streaming with search/filter (`[/]`).
   - Live system resource telemetry (CPU %, RAM, Disk I/O).
-  - Instant on-demand lifecycle controls: `[s]` to Start/Stop, `[r]` to Restart.
+  - Instant on-demand lifecycle controls: `[s]` / `[x]` to Start/Stop selected service, `[a]` to Start All stopped/failed services, `[r]` to Restart.
   - Comprehensive diagnostics modal (`[d]`).
-- **🎯 Execution Profiles (`profiles:`)**: Declare named service groups (e.g., `profiles: { api: [...], full: [...] }`) and boot targeted sub-graphs with `vigiadev up --profile <name>` or via the interactive terminal selector.
+- **🎯 Execution Profiles & Select-All (`profiles:` / `-a`)**: Declare named service groups (e.g., `profiles: { erp: [...], platform: [...] }`) and boot targeted sub-graphs with `vigiadev up -p <name>`, interactive terminal selector, or bypass the prompt to boot everything with `vigiadev up -a` (`-A` / `--all`).
+- **🔍 Live Session & Port Status (`vigiadev status` / `ps`)**: Inspect whether an active session is already running (supervisor PID, `RunID`, per-service `PID`/`PGID` and containers) and detect external port conflicts before starting.
+- **📂 Upward Config Discovery for Modular Monoliths**: Run `vigiadev up`, `status`, `down`, `run`, or `logs` from any nested module directory (e.g., `erp/backend`); vigiaDev automatically walks upward to locate `vigiadev.local.yaml` / `vigiadev.yaml` and anchors paths to the project root.
 - **📄 Layered Environment Hierarchy (`.env`)**: Strict 6-layer precedence merging (`.env` ➔ `.env.local` ➔ `<dir>/.env` ➔ `<dir>/.env.local` ➔ `env_file:` ➔ `env:`), isolating modular credentials cleanly.
 - **🐳 Docker Stale Container Auto-Remediation**: Automatically recovers from Docker name conflicts by removing stopped/dead stale containers, while protecting actively running containers.
 - **🔌 Intelligent Port Conflict Management**: Proactive detection of `EADDRINUSE` with non-invasive remediation tips, deterministic sequential remapping, and preflight conflict inspection (`[y/N/remap]`).
@@ -58,8 +60,7 @@ sudo mv vigiadev /usr/local/bin/
 ```bash
 git clone https://github.com/Rafael-Albernaz-dev/vigiadev.git
 cd vigiadev
-go build -o bin/vigiadev ./cmd/vigiadev
-sudo cp bin/vigiadev /usr/local/bin/
+make build
 ```
 
 ---
@@ -78,24 +79,36 @@ vigiadev init
 vigiadev init --local
 ```
 
-### 2. Validate configuration
+### 2. Validate & Inspect Status
 
 ```bash
+# Validate configuration and DAG dependencies:
 vigiadev validate
+
+# Check if a session is already running and inspect service ports before starting:
+vigiadev status
+# (or shorthand: vigiadev ps)
 ```
 
 ### 3. Spin up the environment
 
 ```bash
-# Starts all services with interactive TUI (presents profile selector if profiles are defined):
+# Starts services with interactive TUI (detects active sessions & presents profile selector):
 vigiadev up
 
+# Start ALL declared services directly (bypasses profile prompt):
+vigiadev up -a
+# (also accepts -A or --all)
+
 # Boot a specific profile directly:
-vigiadev up --profile api
+vigiadev up --profile erp
 vigiadev up -p viabilidade
 
 # Start only a subset of services (dependencies are automatically resolved):
 vigiadev up api frontend
+
+# Replace an already active session and start all services without prompting:
+vigiadev up -a --force
 
 # Run in headless / CI mode with stream logs:
 vigiadev up --no-tui
@@ -104,7 +117,7 @@ vigiadev up --no-tui
 ### 4. Stop and Clean
 
 ```bash
-# Graceful teardown of active session resources:
+# Graceful teardown of active session resources (services, process groups, and supervisor):
 vigiadev down
 
 # Full removal of session cache, lockfiles and optional configurations:
@@ -120,13 +133,15 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | Key / Action | Description |
 | :--- | :--- |
 | **`Tab`** / **`Shift+Tab`** | Switch between tabs (`ALL`, individual services, `METRICS`) |
+| **`↑` / `↓`** | Select service in the status header (when on `ALL` tab) or scroll logs/metrics |
 | **`Mouse Click`** | Click on any tab or status card row to jump directly |
-| **`Mouse Wheel` / `↑ ↓`** | Scroll logs or metrics table smoothly |
+| **`Mouse Wheel`** | Scroll logs or metrics table smoothly |
 | **`1` – `9`** | Quick jump directly to tab by index number |
 | **`/`** | Activate real-time case-insensitive log search and filter |
 | **`Esc`** | Clear filter or dismiss modal |
-| **`s`** | **Start / Stop** the active service on-demand (toggles running state) |
-| **`r`** | **Restart** the active service or container cleanly |
+| **`s`** / **`x`** | **Start / Stop** the selected or active service on-demand |
+| **`a`** / **`A`** | **Start All** stopped or failed services in topological dependency order |
+| **`r`** | **Restart** the selected or active service or container cleanly |
 | **`c`** | Clear logs in the current active tab |
 | **`d`** | Open **Diagnostics & System Doctor** modal |
 | **`q`** / **`Ctrl+C`** | Gracefully terminate all session processes and exit |
@@ -138,9 +153,10 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | Command | Description |
 | :--- | :--- |
 | `vigiadev init [--local] [-f]` | Inspects project repository and generates configuration |
-| `vigiadev up [services...] [-p profile]` | Orchestrates and boots services (or profile subset) with interactive TUI or streaming |
+| `vigiadev up [services...] [-a] [-p profile] [-f]` | Orchestrates and boots services (all or profile subset) with interactive TUI or streaming |
+| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, supervisor PID, service states, and port conflicts |
 | `vigiadev run <task> [--no-deps]` | Executes a declared task resolving prerequisite dependencies |
-| `vigiadev down` | Shuts down processes and containers owned by the active session |
+| `vigiadev down` | Shuts down processes, process groups, containers, and supervisor owned by the active session |
 | `vigiadev remove [-f] [--keep-config]` | Removes `.vigiadev/` runtime data, locks, and optionally configs |
 | `vigiadev logs [service] [-f] [-n]` | Inspects or tails persisted log files in `.vigiadev/logs/` |
 | `vigiadev doctor` | Audits system requirements (Docker, Compose, ports, permissions) |
@@ -151,7 +167,7 @@ When running `vigiadev up`, the interactive TUI provides full control:
 
 ## ⚙️ Configuration Shape (`vigiadev.yaml`)
 
-Configuration lookup order: `--config` flag ➔ `vigiadev.local.yaml` ➔ `vigiadev.yaml` ➔ legacy `dev.yaml`.
+Configuration lookup order (with automatic upward directory traversal from subdirectories): `--config` flag ➔ `vigiadev.local.yaml` ➔ `vigiadev.yaml` ➔ legacy `dev.yaml`.
 
 ```yaml
 version: 1
@@ -222,20 +238,23 @@ vigiaDev follows the principle of **strict ownership**:
 1. **Never destructive by default**: Does not call `docker compose down` or kill external processes unless explicitly instructed via policies or `--kill-ports`.
 2. **Session Ledger (`.vigiadev/run.json`)**: Every spawned process group (`PGID`), PID, working directory (`dir`), and started Docker Container ID is recorded immediately on spawn.
 3. **Surgical Teardown**: Shutdown targets **strictly** the resources recorded in the session ledger, ensuring databases, daemons, or sibling projects remain untouched.
-4. **Stale Lock Recovery**: `.vigiadev/vigiadev.lock` uses PID-liveness validation to safely clean up orphaned locks if an earlier session crashed.
+4. **Active Session Guard & Stale Lock Recovery**: `.vigiadev/vigiadev.lock` validates process liveness (filtering out zombie states in `/proc/<pid>/stat`) to prevent duplicate concurrent sessions while automatically recovering from crashed locks.
 
 ---
 
-## 🧪 Testing & Verification
+## 🧪 Testing, Regression Suite & Quality Gate
 
-vigiaDev is covered by comprehensive unit, integration, and architecture tests:
+vigiaDev enforces a full **Quality Gate** covering static analysis, race-detector unit/integration tests, dedicated regression tests (`test/regression/`), binary build, and modular monolith smoke testing:
 
 ```bash
-# Run full deterministic test suite:
-go test -count=1 ./...
+# Run the complete Quality Gate (vet + race tests + build + smoke test):
+make quality-gate
 
-# Run static analysis:
-go vet ./...
+# Run the dedicated regression & integration test suite with race detector:
+make test-regression
+
+# Run full test suite with race detector:
+go test -v -race ./...
 ```
 
 ---

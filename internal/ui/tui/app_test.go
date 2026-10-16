@@ -128,3 +128,60 @@ func TestAppModel_FooterURLRendering(t *testing.T) {
 	}
 }
 
+func TestAppModel_RestartKeyHandling(t *testing.T) {
+	bus := domain.NewEventBus()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var restartedService string
+	restartFunc := func(service string) error {
+		restartedService = service
+		return nil
+	}
+
+	model := NewAppModel("test-restart", []string{"api", "web"}, map[string]int{"api": 3000, "web": 5000}, bus, cancel, restartFunc)
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*AppModel)
+
+	// 1. Pressionar 'r' na aba ALL (índice 0) deve dar mensagem de ajuda no statusMsg e NÃO reiniciar
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = updated.(*AppModel)
+	if cmd != nil {
+		t.Errorf("esperava cmd nil na aba ALL, obteve %v", cmd)
+	}
+	if !strings.Contains(model.statusMsg, "Select a specific service tab") {
+		t.Errorf("esperava mensagem no statusMsg informando para selecionar aba de serviço, obteve: %q", model.statusMsg)
+	}
+	if restartedService != "" {
+		t.Errorf("não deveria ter reiniciado nenhum serviço na aba ALL")
+	}
+
+	// 2. Mudar para a aba 'api' (índice 1) e pressionar 'R' maiúsculo
+	model.activeTab = 1
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	model = updated.(*AppModel)
+	if cmd == nil {
+		t.Fatal("esperava comando de reinício para 'R' maiúsculo na aba 'api'")
+	}
+	_ = cmd()
+	if restartedService != "api" {
+		t.Errorf("esperava reinício de 'api', obteve %q", restartedService)
+	}
+
+	// 3. Abrir modal de diagnósticos e pressionar 'r'
+	restartedService = ""
+	model.diagnosticsOpen = true
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = updated.(*AppModel)
+	if model.diagnosticsOpen {
+		t.Errorf("modal de diagnósticos deveria ter fechado após pressionar 'r'")
+	}
+	if cmd == nil {
+		t.Fatal("esperava comando de reinício ao pressionar 'r' dentro do modal de diagnósticos")
+	}
+	_ = cmd()
+	if restartedService != "api" {
+		t.Errorf("esperava reinício de 'api' vindo do modal de diagnósticos, obteve %q", restartedService)
+	}
+}
+

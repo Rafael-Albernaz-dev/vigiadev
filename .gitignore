@@ -19,6 +19,7 @@ chatgpt.md
 *.instructions.md
 
 # Agent Directories & Local State
+.agent/
 .agents/
 .gemini/
 .codex/
