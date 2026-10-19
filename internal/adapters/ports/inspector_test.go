@@ -28,6 +28,9 @@ func TestInspectorListenerHelper(t *testing.T) {
 	if network == "tcp6" {
 		address = "[::1]:0"
 	}
+	if configured := os.Getenv("VIGIA_LISTEN_ADDRESS"); configured != "" {
+		address = configured
+	}
 	l, err := net.Listen(network, address)
 	if err != nil {
 		panic(err)
@@ -44,8 +47,13 @@ func TestInspectorListenerHelper(t *testing.T) {
 
 func inspectorChild(t *testing.T, ignore bool, network string) (*exec.Cmd, int) {
 	t.Helper()
+	return inspectorChildAt(t, ignore, network, "")
+}
+
+func inspectorChildAt(t *testing.T, ignore bool, network, address string) (*exec.Cmd, int) {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestInspectorListenerHelper$")
-	cmd.Env = append(os.Environ(), "VIGIA_INSPECTOR_HELPER=1", "VIGIA_LISTEN_NETWORK="+network)
+	cmd.Env = append(os.Environ(), "VIGIA_INSPECTOR_HELPER=1", "VIGIA_LISTEN_NETWORK="+network, "VIGIA_LISTEN_ADDRESS="+address)
 	if ignore {
 		cmd.Env = append(cmd.Env, "VIGIA_IGNORE_TERM=1")
 	}
@@ -146,5 +154,94 @@ func TestKillProcessOnPortRejectsChangedOwner(t *testing.T) {
 	}
 	if NewPortResolver("").IsPortAvailable(port) {
 		t.Fatal("listener lost after refused kill")
+	}
+}
+
+func TestFindAndKillMultipleListeners(t *testing.T) {
+	first, port := inspectorChildAt(t, false, "tcp4", "127.0.0.1:0")
+	second, _ := inspectorChildAt(t, true, "tcp4", fmt.Sprintf("127.0.0.2:%d", port))
+	owners, err := FindProcessesByPort(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owners) != 2 || owners[0].PID != first.Process.Pid || owners[1].PID != second.Process.Pid {
+		t.Fatalf("unexpected owners: %+v", owners)
+	}
+	if err := KillProcessOnPort(port, owners[0], time.Millisecond); err == nil {
+		t.Fatal("single-owner confirmation killed multiple owners")
+	}
+	start := time.Now()
+	if err := KillProcessesOnPort(port, owners, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatal("SIGTERM timeout was not respected")
+	}
+	for _, child := range []*exec.Cmd{first, second} {
+		if err := child.Wait(); err == nil {
+			t.Fatal("child was not terminated by signal")
+		}
+	}
+	if !NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("wildcard bind still blocked")
+	}
+}
+
+func TestKillMultipleListenersRejectsChangedSet(t *testing.T) {
+	first, port := inspectorChildAt(t, false, "tcp4", "127.0.0.1:0")
+	owners, err := FindProcessesByPort(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := inspectorChildAt(t, false, "tcp4", fmt.Sprintf("127.0.0.2:%d", port))
+	if err := KillProcessesOnPort(port, owners, time.Millisecond); err == nil {
+		t.Fatal("changed owner set was accepted")
+	}
+	for _, child := range []*exec.Cmd{first, second} {
+		if err := child.Process.Signal(syscall.Signal(0)); err != nil {
+			t.Fatalf("listener killed after refusal: %v", err)
+		}
+	}
+	current, err := FindProcessesByPort(port)
+	if err != nil || len(current) != 2 {
+		t.Fatalf("expected two live listeners: %v %v", current, err)
+	}
+	current[0].identity = "stale-start-time"
+	if err := KillProcessesOnPort(port, current, time.Millisecond); err == nil {
+		t.Fatal("stale process identity accepted")
+	}
+}
+
+func TestFindMultipleListenersSamePID(t *testing.T) {
+	first, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	port := first.Addr().(*net.TCPAddr).Port
+	second, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.2:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	owners, err := FindProcessesByPort(port)
+	if err != nil || len(owners) != 1 || owners[0].PID != os.Getpid() {
+		t.Fatalf("same PID not deduplicated: %v %v", owners, err)
+	}
+}
+
+func TestFindProcessOwnersRejectsPartialVisibility(t *testing.T) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = findProcessOwners(3001, map[string]bool{"visible": true, "hidden": true}, entries, func(pid int) (map[string]bool, error) {
+		if pid == os.Getpid() {
+			return map[string]bool{"visible": true}, nil
+		}
+		return nil, os.ErrPermission
+	})
+	if !errors.Is(err, ErrProcessInaccessible) {
+		t.Fatalf("partially identified set accepted: %v", err)
 	}
 }

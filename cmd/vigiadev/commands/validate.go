@@ -36,6 +36,9 @@ var validateCmd = &cobra.Command{
 		fmt.Printf("✅ Valid configuration! (%s)\n", cfgPath)
 		fmt.Printf("📦 Project: %s (version %d)\n", cfg.ProjectName, cfg.Version)
 		fmt.Printf("📊 Configured services: %d\n", len(cfg.Services))
+		if len(cfg.Links) > 0 {
+			fmt.Printf("🔗 Navigation shortcuts: %d (URLs validated)\n", len(cfg.Links))
+		}
 		fmt.Printf("🌊 Execution waves (%d):\n", len(plan.Waves))
 		for i, wave := range plan.Waves {
 			fmt.Printf("  Wave %d (parallel): %v\n", i+1, wave)

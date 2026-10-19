@@ -61,6 +61,7 @@ type tabZone struct {
 	index  int
 	startX int
 	endX   int
+	rowY   int
 }
 
 type serviceRowZone struct {
@@ -142,6 +143,7 @@ func checkSystemPrereqs() SystemDoctorInfo {
 // ServiceCardState stores visual state and telemetry data for each supervised service.
 type ServiceCardState struct {
 	Name           string
+	URL            string
 	State          domain.ServiceState
 	Port           int
 	OriginalPort   int
@@ -158,6 +160,7 @@ type ServiceCardState struct {
 type AppModel struct {
 	ProjectName     string
 	services        []string
+	links           []domain.LinkConfig
 	cards           map[string]*ServiceCardState
 	tabs            []string
 	activeTab       int
@@ -169,6 +172,8 @@ type AppModel struct {
 	viewport        viewport.Model
 	width           int
 	height          int
+	pageOffset      int
+	pageOverflow    int
 	ready           bool
 	bus             *domain.EventBus
 	cancel          context.CancelFunc
@@ -201,6 +206,14 @@ func isDatabaseOrRawTCP(name string, port int) bool {
 // formatClickableURL formata uma URL como hiperlink de terminal via sequência ANSI OSC 8.
 func formatClickableURL(url, text string) string {
 	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text)
+}
+
+// SetNavigation supplies display-only URLs without changing operational ports.
+func (m *AppModel) SetNavigation(services map[string]domain.ServiceConfig, links []domain.LinkConfig) {
+	for name, card := range m.cards {
+		card.URL = services[name].URL
+	}
+	m.links = append([]domain.LinkConfig(nil), links...)
 }
 
 // SetToggleFunc atribui o callback para iniciar ou parar um serviço individualmente.
@@ -264,10 +277,27 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.pageOverflow > 0 {
+			switch msg.String() {
+			case "up", "pgup", "home":
+				m.pageOffset = max(0, m.pageOffset-3)
+				if msg.String() == "home" {
+					m.pageOffset = 0
+				}
+				return m, nil
+			case "down", "pgdown", "end":
+				m.pageOffset = min(m.pageOverflow, m.pageOffset+3)
+				if msg.String() == "end" {
+					m.pageOffset = m.pageOverflow
+				}
+				return m, nil
+			}
+		}
 		if m.diagnosticsOpen {
 			switch msg.String() {
 			case "d", "D", "esc":
 				m.diagnosticsOpen = false
+				m.pageOffset = 0
 				return m, nil
 			case "r", "R":
 				m.diagnosticsOpen = false
@@ -327,6 +357,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "d", "D":
 			m.diagnosticsOpen = true
+			m.pageOffset = 0
 			m.doctorInfo = checkSystemPrereqs()
 			return m, nil
 
@@ -408,10 +439,18 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		// 1. Mouse Wheel scrolling
 		if msg.Button == tea.MouseButtonWheelUp || msg.Type == tea.MouseWheelUp {
+			if m.pageOverflow > 0 {
+				m.pageOffset = max(0, m.pageOffset-3)
+				return m, nil
+			}
 			m.viewport.LineUp(3)
 			return m, nil
 		}
 		if msg.Button == tea.MouseButtonWheelDown || msg.Type == tea.MouseWheelDown {
+			if m.pageOverflow > 0 {
+				m.pageOffset = min(m.pageOverflow, m.pageOffset+3)
+				return m, nil
+			}
 			m.viewport.LineDown(3)
 			return m, nil
 		}
@@ -419,10 +458,13 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 2. Mouse click handling (tab bar or status card row)
 		isLeftClick := msg.Button == tea.MouseButtonLeft || msg.Type == tea.MouseLeft
 		if isLeftClick {
-			// A. Tab Bar click (with ±1 line tolerance)
-			if m.tabRowYStart > 0 && msg.Y >= m.tabRowYStart-1 && msg.Y <= m.tabRowYEnd+1 {
+			if m.pageOverflow > 0 {
+				msg.Y += m.pageOffset - 1
+			}
+			// A. Tab Bar click on the exact wrapped row.
+			if msg.Y >= m.tabRowYStart && msg.Y <= m.tabRowYEnd {
 				for _, tz := range m.tabZones {
-					if msg.X >= tz.startX && msg.X <= tz.endX {
+					if msg.Y == tz.rowY && msg.X >= tz.startX && msg.X <= tz.endX {
 						m.activeTab = tz.index
 						m.syncViewport()
 						return m, nil
@@ -619,7 +661,9 @@ func (m *AppModel) renderMetricsDashboard() string {
 			}
 		}
 		content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Network Port (TCP):"), valStyle.Render(portStr)))
-		if card.Port > 0 {
+		if card.URL != "" {
+			content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Service Web URL:"), valStyle.Render(formatClickableURL(card.URL, card.URL))))
+		} else if card.Port > 0 {
 			if isDatabaseOrRawTCP(card.Name, card.Port) {
 				content.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Database / TCP:"), valStyle.Render(fmt.Sprintf("localhost:%d", card.Port))))
 			} else {
@@ -652,15 +696,12 @@ func (m *AppModel) renderMetricsDashboard() string {
 }
 
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
+	return ansi.Truncate(s, maxLen, "...")
 }
 
 func (m *AppModel) View() string {
 	if m.diagnosticsOpen {
-		return m.renderDiagnostics()
+		return m.fitPage(m.renderDiagnostics())
 	}
 	if !m.ready {
 		return "\n  Initializing vigiaDev TUI..."
@@ -695,8 +736,22 @@ func (m *AppModel) View() string {
 		maxNameLen = 24
 	}
 
-	boxStartY := lipgloss.Height(b.String())
+	boxStartY := lipgloss.Height(b.String()) - 1
 	m.serviceZones = make([]serviceRowZone, 0, len(m.services))
+	networkWidth := 28
+	hasNavigation := len(m.links) > 0
+	for _, card := range m.cards {
+		hasNavigation = hasNavigation || card.URL != ""
+		if width := lipgloss.Width(card.URL); width > networkWidth {
+			networkWidth = width
+		}
+	}
+	resourceWidth := 22
+	if hasNavigation && m.width > 40 {
+		networkWidth = min(networkWidth, max(12, m.width-34))
+		maxNameLen = min(maxNameLen, max(6, m.width-28-networkWidth))
+		resourceWidth = min(resourceWidth, max(0, m.width-6-(12+maxNameLen+2+networkWidth+8)))
+	}
 
 	for i, name := range m.services {
 		card := m.cards[name]
@@ -723,7 +778,9 @@ func (m *AppModel) View() string {
 		namePadded := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FAFAFA")).Width(maxNameLen + 2).Render(truncate(card.Name, maxNameLen))
 
 		portStr := "-"
-		if card.Port > 0 {
+		if card.URL != "" {
+			portStr = formatClickableURL(card.URL, card.URL)
+		} else if card.Port > 0 {
 			if isDatabaseOrRawTCP(card.Name, card.Port) {
 				if card.IsRemapped {
 					portStr = fmt.Sprintf(":%d➔:%d", card.OriginalPort, card.Port)
@@ -739,19 +796,24 @@ func (m *AppModel) View() string {
 				portStr = formatClickableURL(targetURL, displayText)
 			}
 		}
-		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(28).Render(portStr)
+		portCol := lipgloss.NewStyle().Foreground(accentColor).Width(networkWidth).Render(ansi.Truncate(portStr, networkWidth, "…"))
 
 		resStr := "-"
 		if card.CPUPercent > 0 || card.MemoryBytes > 0 {
 			resStr = fmt.Sprintf("%s CPU • %s", telemetry.FormatCPU(card.CPUPercent), telemetry.FormatBytes(card.MemoryBytes))
 		}
-		resCol := lipgloss.NewStyle().Foreground(lipgloss.Color("#D0D0D0")).Width(22).Render(resStr)
+		resCol := lipgloss.NewStyle().Foreground(lipgloss.Color("#D0D0D0")).Width(resourceWidth).Render(ansi.Truncate(resStr, resourceWidth, "…"))
 
 		detailStr := ""
 		if card.Detail != "" {
 			detailStr = card.Detail
 		}
-		detailCol := lipgloss.NewStyle().Foreground(subtleColor).Render(truncate(detailStr, 36))
+		detailWidth := 36
+		if hasNavigation && m.width > 0 {
+			// Keep long canonical URLs on one row by budgeting the details column.
+			detailWidth = min(detailWidth, max(0, m.width-6-(12+maxNameLen+2+networkWidth+resourceWidth+8)))
+		}
+		detailCol := lipgloss.NewStyle().Foreground(subtleColor).Render(truncate(detailStr, detailWidth))
 
 		row := fmt.Sprintf("%s  %s  %s  %s  %s", stateBadge, namePadded, portCol, resCol, detailCol)
 		statusCardContent.WriteString(row)
@@ -783,11 +845,21 @@ func (m *AppModel) View() string {
 	renderedBox := boxStyle.Render(statusCardContent.String())
 	b.WriteString(renderedBox + "\n")
 
+	if m.activeTab == 0 && len(m.links) > 0 {
+		var shortcuts strings.Builder
+		shortcuts.WriteString(lipgloss.NewStyle().Bold(true).Foreground(accentColor).Render("NAVIGATION SHORTCUTS"))
+		for _, link := range m.links {
+			fmt.Fprintf(&shortcuts, "\n%s  %s", link.Name, formatClickableURL(link.URL, link.URL))
+		}
+		b.WriteString(boxStyle.Render(shortcuts.String()) + "\n")
+	}
+
 	// 3. Tab Bar (with exact click coordinate mapping)
-	tabRowStart := lipgloss.Height(b.String())
+	tabRowStart := lipgloss.Height(b.String()) - 1
 	m.tabZones = make([]tabZone, len(m.tabs))
 	var tabsRow strings.Builder
 	curX := 0
+	curY := tabRowStart
 
 	for i, tab := range m.tabs {
 		tabLabel := fmt.Sprintf("%d:%s", i+1, tab)
@@ -797,6 +869,9 @@ func (m *AppModel) View() string {
 		}
 
 		var renderedTab string
+		if m.width > 3 {
+			tabLabel = ansi.Truncate(tabLabel, m.width-3, "…")
+		}
 		if i == m.activeTab {
 			renderedTab = activeTabStyle.Render(tabLabel)
 		} else {
@@ -804,10 +879,16 @@ func (m *AppModel) View() string {
 		}
 
 		tabW := lipgloss.Width(renderedTab)
+		if m.width > 0 && curX > 0 && curX+tabW > m.width {
+			tabsRow.WriteByte('\n')
+			curX = 0
+			curY++
+		}
 		m.tabZones[i] = tabZone{
 			index:  i,
 			startX: curX,
-			endX:   curX + tabW,
+			endX:   curX + tabW - 1,
+			rowY:   curY,
 		}
 		curX += tabW
 
@@ -822,6 +903,10 @@ func (m *AppModel) View() string {
 	b.WriteString(tabsContent + "\n")
 
 	// 4. Viewport (Logs or Metrics)
+	// Account for shortcuts and wrapped rows when reserving log space.
+	if hasNavigation {
+		m.viewport.Height = max(1, m.height-lipgloss.Height(b.String())-2)
+	}
 	b.WriteString(m.viewport.View() + "\n")
 
 	// 5. Interactive Footer
@@ -837,20 +922,25 @@ func (m *AppModel) View() string {
 			Render(fmt.Sprintf("FILTER: /%s█", m.filterQuery))
 		filterHelp := lipgloss.NewStyle().Foreground(subtleColor).Render("  [Enter] Apply  •  [Esc] Clear & Exit")
 		b.WriteString(filterPrompt + filterHelp)
-		return b.String()
+		return m.fitPage(b.String())
 	}
 
 	if currentTab != "ALL" && currentTab != "METRICS" {
 		urlSnippet := ""
-		if card, ok := m.cards[currentTab]; ok && card.Port > 0 {
-			if isDatabaseOrRawTCP(card.Name, card.Port) {
+		if card, ok := m.cards[currentTab]; ok {
+			if card.URL != "" {
+				urlSnippet = fmt.Sprintf("  •  🌐 %s", formatClickableURL(card.URL, card.URL))
+			} else if card.Port > 0 && isDatabaseOrRawTCP(card.Name, card.Port) {
 				urlSnippet = fmt.Sprintf("  •  🔌 localhost:%d", card.Port)
-			} else {
+			} else if card.Port > 0 {
 				rawURL := fmt.Sprintf("http://localhost:%d", card.Port)
 				urlSnippet = fmt.Sprintf("  •  🌐 %s", formatClickableURL(rawURL, rawURL))
 			}
 		}
-		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [a] Start All  •  [r] Restart '%s'  •  [s] Start/Stop%s  •  [c] Clear  •  [q] Quit", currentTab, urlSnippet)
+		footerText = fmt.Sprintf("[Tab/Click] Switch  •  [/] Filter  •  [a] Start All  •  [r] Restart '%s'  •  [s] Start/Stop  •  [c] Clear  •  [q] Quit", currentTab)
+		if urlSnippet != "" {
+			footerText = strings.TrimSpace(urlSnippet) + "\n" + footerText
+		}
 	} else if currentTab == "METRICS" {
 		footerText = "[Tab/Click] Switch  •  [Scroll/Arrows] Scroll Metrics  •  [q] Quit"
 	} else {
@@ -878,9 +968,27 @@ func (m *AppModel) View() string {
 		footerText = fmt.Sprintf("[vigiadev] %s  •  %s", m.statusMsg, footerText)
 	}
 
-	b.WriteString(footerStyle.Render(footerText))
+	b.WriteString(footerStyle.Width(m.width).Render(footerText))
 
-	return b.String()
+	return m.fitPage(b.String())
+}
+
+// fitPage keeps all navigation reachable when the dashboard exceeds the terminal.
+func (m *AppModel) fitPage(content string) string {
+	if m.width <= 0 || m.height <= 1 {
+		return content
+	}
+	content = ansi.Wrap(content, m.width, "")
+	lines := strings.Split(content, "\n")
+	if len(lines) <= m.height {
+		m.pageOverflow, m.pageOffset = 0, 0
+		return content
+	}
+	visible := m.height - 1
+	m.pageOverflow = len(lines) - visible
+	m.pageOffset = min(m.pageOverflow, max(0, m.pageOffset))
+	hint := fmt.Sprintf("↑/↓ or wheel: scroll page (%d–%d of %d)", m.pageOffset+1, m.pageOffset+visible, len(lines))
+	return ansi.Truncate(hint, m.width, "…") + "\n" + strings.Join(lines[m.pageOffset:m.pageOffset+visible], "\n")
 }
 
 func (m *AppModel) renderDiagnostics() string {
@@ -1035,6 +1143,9 @@ func (m *AppModel) renderDiagnostics() string {
 			latencyStr,
 			detailFormatted,
 		)
+		if card != nil && card.URL != "" {
+			fmt.Fprintf(&b, "  Navigation: %s\n", formatClickableURL(card.URL, card.URL))
+		}
 	}
 
 	b.WriteString("\n")

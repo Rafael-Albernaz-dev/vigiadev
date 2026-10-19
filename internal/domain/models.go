@@ -40,6 +40,7 @@ type HealthCheckConfig struct {
 // ServiceConfig representa a declaração de um serviço no vigiaDev.
 type ServiceConfig struct {
 	Dir            string             `yaml:"dir,omitempty"`
+	URL            string             `yaml:"url,omitempty"`
 	Command        []string           `yaml:"command,omitempty"`
 	Ports          []int              `yaml:"ports,omitempty"`
 	PortPolicy     PortPolicy         `yaml:"port_policy,omitempty"`
@@ -64,12 +65,19 @@ type TaskConfig struct {
 	Env       map[string]string `yaml:"env,omitempty"`
 }
 
+// LinkConfig declares a navigation shortcut independent of operational ports.
+type LinkConfig struct {
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
+}
+
 // VigiaConfig é a estrutura raiz do arquivo vigiadev.yaml.
 type VigiaConfig struct {
 	Version     int                      `yaml:"version"`
 	ProjectName string                   `yaml:"project_name"`
 	ComposeFile string                   `yaml:"compose_file,omitempty"`
 	Profiles    map[string][]string      `yaml:"profiles,omitempty"`
+	Links       []LinkConfig             `yaml:"links,omitempty"`
 	Services    map[string]ServiceConfig `yaml:"services,omitempty"`
 	Tasks       map[string]TaskConfig    `yaml:"tasks,omitempty"`
 }

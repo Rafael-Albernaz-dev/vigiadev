@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -117,6 +118,19 @@ func socketInodes(pid int) (map[string]bool, error) {
 // FindProcessByPort returns one unambiguous TCP listener owner, or an error.
 // Inaccessible or shared listeners fail closed rather than guessing an owner.
 func FindProcessByPort(port int) (*ProcessInfo, error) {
+	owners, err := FindProcessesByPort(port)
+	if err != nil {
+		return nil, err
+	}
+	if len(owners) != 1 {
+		return nil, fmt.Errorf("port %d has multiple listener owners; use multi-process resolution", port)
+	}
+	return owners[0], nil
+}
+
+// FindProcessesByPort returns every visible owner, ordered by PID. Missing socket
+// ownership fails closed: callers must not terminate a partially identified set.
+func FindProcessesByPort(port int) ([]*ProcessInfo, error) {
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("invalid TCP port %d", port)
 	}
@@ -140,11 +154,22 @@ func FindProcessByPort(port int) (*ProcessInfo, error) {
 		}
 		return nil, err
 	}
-	return findProcessOwner(port, wanted, entries, socketInodes)
+	return findProcessOwners(port, wanted, entries, socketInodes)
 }
 
 func findProcessOwner(port int, wanted map[string]bool, entries []os.DirEntry, scan func(int) (map[string]bool, error)) (*ProcessInfo, error) {
-	var found *ProcessInfo
+	owners, err := findProcessOwners(port, wanted, entries, scan)
+	if err != nil {
+		return nil, err
+	}
+	if len(owners) != 1 {
+		return nil, fmt.Errorf("port %d has multiple listener owners", port)
+	}
+	return owners[0], nil
+}
+
+func findProcessOwners(port int, wanted map[string]bool, entries []os.DirEntry, scan func(int) (map[string]bool, error)) ([]*ProcessInfo, error) {
+	var found []*ProcessInfo
 	matched := make(map[string]bool)
 	inaccessible := false
 	for _, entry := range entries {
@@ -169,9 +194,6 @@ func findProcessOwner(port int, wanted map[string]bool, entries []os.DirEntry, s
 		if !owns {
 			continue
 		}
-		if found != nil {
-			return nil, fmt.Errorf("port %d has multiple listener owners; refusing ambiguous process selection", port)
-		}
 		identity, _, err := processIdentity(pid)
 		if err != nil {
 			if errors.Is(err, os.ErrPermission) {
@@ -193,38 +215,80 @@ func findProcessOwner(port int, wanted map[string]bool, entries []os.DirEntry, s
 			}
 			return nil, err
 		}
-		found = &ProcessInfo{PID: pid, Name: strings.TrimSpace(string(name)), CommandLine: strings.TrimSpace(strings.ReplaceAll(string(command), "\x00", " ")), identity: identity}
+		found = append(found, &ProcessInfo{PID: pid, Name: strings.TrimSpace(string(name)), CommandLine: strings.TrimSpace(strings.ReplaceAll(string(command), "\x00", " ")), identity: identity})
 	}
-	if found == nil || len(matched) != len(wanted) {
+	if len(found) == 0 || len(matched) != len(wanted) {
 		if inaccessible {
 			return nil, fmt.Errorf("port %d: %w", port, ErrProcessInaccessible)
 		}
 		return nil, fmt.Errorf("port %d: %w (owner hidden or exited)", port, ErrProcessInaccessible)
 	}
+	sort.Slice(found, func(i, j int) bool { return found[i].PID < found[j].PID })
 	return found, nil
 }
 
-// KillProcessOnPort rechecks the confirmed owner immediately before termination.
+// KillProcessOnPort preserves the single-owner confirmation contract for callers
+// that display just one PID. Multi-owner callers must confirm the entire set.
 func KillProcessOnPort(port int, expected *ProcessInfo, timeout time.Duration) error {
-	current, err := FindProcessByPort(port)
+	return KillProcessesOnPort(port, []*ProcessInfo{expected}, timeout)
+}
+
+// KillProcessesOnPort validates the complete snapshot before sending signals.
+// It never kills a new listener that appeared after inspection/confirmation.
+func KillProcessesOnPort(port int, expected []*ProcessInfo, timeout time.Duration) error {
+	current, err := FindProcessesByPort(port)
 	if err != nil {
 		return err
 	}
-	if expected == nil || current.PID != expected.PID || current.identity != expected.identity {
-		return fmt.Errorf("listener owner changed on port %d; confirmation expired", port)
+	if len(current) != len(expected) {
+		return fmt.Errorf("listener owners changed on port %d; confirmation expired", port)
 	}
-	if err := KillProcessByPID(current.PID, timeout); err != nil {
+	confirmed := make(map[int]string, len(expected))
+	for _, info := range expected {
+		if info == nil || info.identity == "" {
+			return fmt.Errorf("unconfirmed owner on port %d", port)
+		}
+		confirmed[info.PID] = info.identity
+	}
+	if len(confirmed) != len(current) {
+		return fmt.Errorf("unconfirmed owners on port %d", port)
+	}
+	for _, info := range current {
+		if confirmed[info.PID] != info.identity {
+			return fmt.Errorf("listener owner changed on port %d; confirmation expired", port)
+		}
+	}
+	var failures []error
+	for _, info := range current {
+		if err := killProcessByPID(info.PID, info.identity, timeout, false); err != nil {
+			failures = append(failures, fmt.Errorf("PID %d on port %d: %w", info.PID, port, err))
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
 		return err
 	}
-	if !NewPortResolver("").IsPortAvailable(port) {
-		return fmt.Errorf("port %d remains occupied after termination", port)
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
 	}
-	return nil
+	deadline := time.Now().Add(timeout)
+	for {
+		if NewPortResolver("").IsPortAvailable(port) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("port %d remains occupied after termination", port)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // KillProcessByPID sends SIGTERM, waits, then escalates to SIGKILL if necessary.
 // Success requires both process exit and successful binds on its former listeners.
 func KillProcessByPID(pid int, timeout time.Duration) error {
+	return killProcessByPID(pid, "", timeout, true)
+}
+
+func killProcessByPID(pid int, expectedIdentity string, timeout time.Duration, verifyBinds bool) error {
 	if pid <= 1 || pid == os.Getpid() {
 		return fmt.Errorf("refusing unsafe PID %d", pid)
 	}
@@ -237,6 +301,9 @@ func KillProcessByPID(pid int, timeout time.Duration) error {
 	}
 	if err != nil {
 		return err
+	}
+	if expectedIdentity != "" && identity != expectedIdentity {
+		return fmt.Errorf("PID %d changed identity", pid)
 	}
 	name, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if err != nil {
@@ -309,6 +376,9 @@ func KillProcessByPID(pid int, timeout time.Duration) error {
 		if !wait() {
 			return fmt.Errorf("PID %d did not exit after SIGKILL", pid)
 		}
+	}
+	if !verifyBinds {
+		return nil
 	}
 	deadline := time.Now().Add(timeout)
 	for {

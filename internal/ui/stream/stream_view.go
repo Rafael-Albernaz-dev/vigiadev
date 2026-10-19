@@ -47,6 +47,20 @@ func (sv *StreamView) Attach(bus *domain.EventBus) {
 	})
 }
 
+// PrintLinks prints configured shortcuts once, before service output begins.
+func (sv *StreamView) PrintLinks(links []domain.LinkConfig) {
+	if len(links) == 0 {
+		return
+	}
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	fmt.Fprintln(sv.out, "NAVIGATION SHORTCUTS")
+	for _, link := range links {
+		fmt.Fprintf(sv.out, "  %s: %s\n", link.Name, link.URL)
+	}
+	fmt.Fprintln(sv.out)
+}
+
 func (sv *StreamView) handleEvent(event domain.Event) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()

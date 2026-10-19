@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	VigiaDir     = ".vigiadev"
-	RunFile      = "run.json"
-	LockFile     = "vigiadev.lock"
+	VigiaDir = ".vigiadev"
+	RunFile  = "run.json"
+	LockFile = "vigiadev.lock"
 )
 
 // ServiceManifest armazena metadados de processo para rastreamento estrito de posse.
@@ -49,7 +49,8 @@ func EnsureVigiaDir(workDir string) (string, error) {
 	return dir, nil
 }
 
-// WriteManifest serializa o manifesto em .vigiadev/run.json.
+// WriteManifest publishes a complete snapshot atomically. Readers that already
+// opened run.json retain the previous snapshot until they close the file.
 func WriteManifest(workDir string, m *RunManifest) error {
 	dir, err := EnsureVigiaDir(workDir)
 	if err != nil {
@@ -62,7 +63,36 @@ func WriteManifest(workDir string, m *RunManifest) error {
 	}
 
 	path := filepath.Join(dir, RunFile)
-	return os.WriteFile(path, data, 0644)
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat manifest: %w", err)
+	}
+
+	// Keep the temporary file on the same filesystem so rename is atomic.
+	temp, err := os.CreateTemp(dir, ".run-*.json")
+	if err != nil {
+		return fmt.Errorf("create manifest snapshot: %w", err)
+	}
+	defer os.Remove(temp.Name())
+	defer temp.Close()
+	if err := temp.Chmod(mode); err != nil {
+		return fmt.Errorf("set manifest permissions: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		return fmt.Errorf("write manifest snapshot: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync manifest snapshot: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close manifest snapshot: %w", err)
+	}
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return fmt.Errorf("replace manifest: %w", err)
+	}
+	return nil
 }
 
 // ReadManifest lê o manifesto ativo em .vigiadev/run.json.

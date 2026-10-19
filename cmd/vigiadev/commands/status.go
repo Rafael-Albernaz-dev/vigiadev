@@ -14,6 +14,7 @@ import (
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
 
@@ -160,6 +161,8 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 		}
 
 		portDetails := []string{}
+		serviceUntracked := []string{}
+		unknownUntracked := false
 		if hasCfg && len(svcCfg.Ports) > 0 {
 			policy := svcCfg.PortPolicy
 			if policy == "" {
@@ -170,40 +173,51 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 					portDetails = append(portDetails, fmt.Sprintf(":%d free", port))
 					continue
 				}
-				info, err := ports.FindProcessByPort(port)
-				if err == nil && info != nil {
+				owners, err := ports.FindProcessesByPort(port)
+				if err != nil {
+					if policy == domain.PortPolicyReuse || svcCfg.ComposeService != "" {
+						procState = "EXTERNAL / UNVERIFIED"
+						portDetails = append(portDetails, fmt.Sprintf(":%d active (external/docker, policy=%s; owner unavailable)", port, policy))
+					} else {
+						unknownUntracked = true
+						externalConflicts++
+						portDetails = append(portDetails, fmt.Sprintf(":%d occupied [policy=%s; %v]", port, policy, err))
+					}
+					continue
+				}
+				untracked := []string{}
+				for _, info := range owners {
 					ownedBySession := false
-					if _, ok := sessionPIDs[info.PID]; ok {
-						ownedBySession = true
-					} else if pgid, pgErr := syscall.Getpgid(info.PID); pgErr == nil {
-						if _, ok := sessionPGIDs[pgid]; ok {
+					if lockAlive {
+						if _, ok := sessionPIDs[info.PID]; ok {
 							ownedBySession = true
+						} else if pgid, pgErr := syscall.Getpgid(info.PID); pgErr == nil {
+							_, ownedBySession = sessionPGIDs[pgid]
 						}
 					}
 					if ownedBySession {
 						portDetails = append(portDetails, fmt.Sprintf(":%d active (session PID %d %s)", port, info.PID, info.Name))
 					} else {
-						externalConflicts++
 						portDetails = append(portDetails, fmt.Sprintf(":%d occupied by PID %d (%s) [policy=%s]", port, info.PID, info.Name, policy))
+						untracked = append(untracked, fmt.Sprintf("%d", info.PID))
 					}
-				} else if errors.Is(err, ports.ErrProcessInaccessible) {
-					if policy == domain.PortPolicyReuse {
-						portDetails = append(portDetails, fmt.Sprintf(":%d active (external/docker, policy=reuse)", port))
+				}
+				if len(untracked) > 0 {
+					if policy == domain.PortPolicyReuse || svcCfg.ComposeService != "" {
+						procState = "EXTERNAL / REUSED"
 					} else {
 						externalConflicts++
-						portDetails = append(portDetails, fmt.Sprintf(":%d occupied by system/docker process [policy=%s]", port, policy))
-					}
-				} else {
-					if hasManifest && ((entry.PID > 1 && manifest.IsPIDAlive(entry.PID)) || entry.IsContainer) {
-						portDetails = append(portDetails, fmt.Sprintf(":%d active", port))
-					} else {
-						externalConflicts++
-						portDetails = append(portDetails, fmt.Sprintf(":%d occupied [policy=%s]", port, policy))
+						serviceUntracked = append(serviceUntracked, untracked...)
 					}
 				}
 			}
 		}
 
+		if len(serviceUntracked) > 0 {
+			procState = fmt.Sprintf("🟡 UNTRACKED / ORPHAN (PID %s listening)", strings.Join(serviceUntracked, ", "))
+		} else if unknownUntracked {
+			procState = "🟡 UNTRACKED (owner unavailable)"
+		}
 		if len(portDetails) > 0 {
 			fmt.Fprintf(out, "  • %-22s %-30s | Ports: %s\n", name, procState, strings.Join(portDetails, ", "))
 		} else {
@@ -213,8 +227,18 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 
 	if lockAlive {
 		fmt.Fprintf(out, "\n💡 Active session is running (PID %d). Run 'vigiadev down' to stop it, or 'vigiadev up --force' to restart.\n", lockPID)
-	} else if externalConflicts > 0 {
-		fmt.Fprintf(out, "\n⚠️ Detected %d occupied port(s) outside active session. Use 'vigiadev up -k' to resolve port conflicts interactively.\n", externalConflicts)
+	}
+	if externalConflicts > 0 {
+		alert := strings.Join([]string{
+			"⚠️  UNTRACKED PROCESSES DETECTED ON PROJECT PORTS",
+			fmt.Sprintf("%d occupied port(s) outside active session management.", externalConflicts),
+			"Active listeners do not prove application health or session ownership.",
+			"",
+			"👉 Run 'vigiadev resolve' to terminate host listeners and free ports.",
+			"👉 Or run 'vigiadev down' to stop resources and clear host ports.",
+			"Reusable infrastructure is preserved.",
+		}, "\n")
+		fmt.Fprintln(out, "\n"+lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(0, 1).Render(alert))
 	}
 
 	return nil

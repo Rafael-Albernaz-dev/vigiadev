@@ -20,18 +20,21 @@
 - **📦 Deep Monorepo & Modular Stack Detection**: Automatically discovers nested modular apps (`backend/apps/*`, `frontend/apps/*`, npm/pnpm/yarn/bun workspaces) with dedicated execution directories (`dir:`). Interspects real backend ports from Vite proxy configs, manifests, or source code, automatically wires DAG dependencies (`depends_on: [<module>-backend]`), and synthesizes declarative execution profiles.
 - **🛡️ Strict Safety & Teardown Model**: Never runs destructive commands (`docker compose down`, `kill -9`) without explicit policy. Tracks every PID, PGID, working directory, and Container ID in `.vigiadev/run.json` with immediate spawn persistence. Automatically cleans up stale/orphaned processes across subdirectories on `vigiadev up` while preserving external workloads.
 - **🖥️ Interactive Charm.sh TUI**: Rich terminal interface powered by Bubble Tea, Lip Gloss, and Bubbles:
-  - Native terminal clickable hyperlinks via **ANSI OSC 8** (`http://localhost:<port>`) supporting direct Ctrl+Click in modern terminals.
+  - Native terminal clickable hyperlinks via **ANSI OSC 8** supporting direct Ctrl+Click in modern terminals.
+  - Decoupled navigation URLs (`url:`) and global navigation shortcuts (`links:`) for reverse proxies (e.g. Nginx, Zitadel SSO) while preserving internal operational ports.
+  - Multi-line wrapped tab bar supporting large monoliths (15+ services) with 2D mouse hit-testing and full dashboard vertical page scrolling (`fitPage`) on small terminals (e.g., 80×24).
   - Semantic port presentation: active web services display navigable hyperlinks, while databases and brokers display raw listening sockets (`:5432`, `:6379`).
   - Real-time log streaming with search/filter (`[/]`).
   - Live system resource telemetry (CPU %, RAM, Disk I/O).
   - Instant on-demand lifecycle controls: `[s]` / `[x]` to Start/Stop selected service, `[a]` to Start All stopped/failed services, `[r]` to Restart.
   - Comprehensive diagnostics modal (`[d]`).
 - **🎯 Execution Profiles & Select-All (`profiles:` / `-a`)**: Declare named service groups (e.g., `profiles: { erp: [...], platform: [...] }`) and boot targeted sub-graphs with `vigiadev up -p <name>`, interactive terminal selector, or bypass the prompt to boot everything with `vigiadev up -a` (`-A` / `--all`).
-- **🔍 Live Session & Port Status (`vigiadev status` / `ps`)**: Inspect whether an active session is already running (supervisor PID, `RunID`, per-service `PID`/`PGID` and containers) and detect external port conflicts before starting.
+- **🔍 Live Session, Untracked Listeners & Port Status (`vigiadev status` / `ps`)**: Inspects active supervisor session, detects untracked/orphan host processes, and displays prominent visual alert banners with remediation guidance.
+- **🧹 Deterministic Port Conflict Resolution (`vigiadev resolve`)**: Inspects and terminates conflicting processes occupying project host ports with multi-listener resolution (handling coexisting host apps and Docker bridge socats), liberating sockets without interactive friction.
 - **📂 Upward Config Discovery for Modular Monoliths**: Run `vigiadev up`, `status`, `down`, `run`, or `logs` from any nested module directory (e.g., `erp/backend`); vigiaDev automatically walks upward to locate `vigiadev.local.yaml` / `vigiadev.yaml` and anchors paths to the project root.
 - **📄 Layered Environment Hierarchy (`.env`)**: Strict 6-layer precedence merging (`.env` ➔ `.env.local` ➔ `<dir>/.env` ➔ `<dir>/.env.local` ➔ `env_file:` ➔ `env:`), isolating modular credentials cleanly.
 - **🐳 Docker Stale Container Auto-Remediation**: Automatically recovers from Docker name conflicts by removing stopped/dead stale containers, while protecting actively running containers.
-- **🔌 Intelligent Port Conflict Management**: Proactive detection of `EADDRINUSE` with non-invasive remediation tips, deterministic sequential remapping, and preflight conflict inspection (`[y/N/remap]`).
+- **🔌 Intelligent Port Conflict Management & Unconditional Down**: Proactive detection of `EADDRINUSE`, sequential remapping, and unconditional cleanup of lingering host ports on `vigiadev down`.
 - **🏃 Task Runner with Keep-Alive**: Execute one-off commands (`vigiadev run <task>`) with automated topological dependency resolution, TCP readiness probes, and argument passthrough.
 
 ---
@@ -154,13 +157,14 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | :--- | :--- |
 | `vigiadev init [--local] [-f]` | Inspects project repository and generates configuration |
 | `vigiadev up [services...] [-a] [-p profile] [-f]` | Orchestrates and boots services (all or profile subset) with interactive TUI or streaming |
-| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, supervisor PID, service states, and port conflicts |
+| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, supervisor PID, untracked/orphan listeners, and highlighted port conflicts |
+| `vigiadev resolve` (aliases: `clean-ports`, `resolve-ports`) | Inspects and terminates conflicting processes on project host ports, liberating sockets immediately |
 | `vigiadev run <task> [--no-deps]` | Executes a declared task resolving prerequisite dependencies |
-| `vigiadev down` | Shuts down processes, process groups, containers, and supervisor owned by the active session |
+| `vigiadev down` | Shuts down active session and unconditionally terminates lingering processes on project host ports |
 | `vigiadev remove [-f] [--keep-config]` | Removes `.vigiadev/` runtime data, locks, and optionally configs |
 | `vigiadev logs [service] [-f] [-n]` | Inspects or tails persisted log files in `.vigiadev/logs/` |
 | `vigiadev doctor` | Audits system requirements (Docker, Compose, ports, permissions) |
-| `vigiadev validate [-c config]` | Lints and validates configuration file and DAG topological cycles |
+| `vigiadev validate [-c config]` | Lints and validates configuration file, navigation URLs, and DAG topological cycles |
 | `vigiadev version` | Displays CLI version, Git commit hash, and build date |
 
 ---
@@ -172,6 +176,13 @@ Configuration lookup order (with automatic upward directory traversal from subdi
 ```yaml
 version: 1
 project_name: my-app
+
+# Global navigation shortcuts for modern reverse-proxy/SSO setups
+links:
+  - name: "Platform Entry"
+    url: "http://platform.localhost:8080/"
+  - name: "API Documentation"
+    url: "http://platform.localhost:8080/docs"
 
 # Declarative execution profiles
 profiles:
@@ -208,13 +219,14 @@ services:
       url: "http://127.0.0.1:3000/health"
       expected_status: 200
 
-  # Frontend app
+  # Frontend app with decoupled navigation URL for browser & reverse proxy
   frontend:
     dir: frontend
     command: ["npm", "run", "dev"]
     depends_on: [backend]
     ports: [5173]
     port_policy: remap
+    url: "http://platform.localhost:8080/"
     healthcheck:
       type: tcp
       port: 5173

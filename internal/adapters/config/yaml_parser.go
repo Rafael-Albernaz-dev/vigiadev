@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -76,6 +77,7 @@ type rawConfig struct {
 	ProjectName string                          `yaml:"project_name"`
 	ComposeFile string                          `yaml:"compose_file,omitempty"`
 	Profiles    map[string][]string             `yaml:"profiles,omitempty"`
+	Links       []domain.LinkConfig             `yaml:"links,omitempty"`
 	Services    map[string]domain.ServiceConfig `yaml:"services,omitempty"`
 	Tasks       map[string]rawTaskConfig        `yaml:"tasks,omitempty"`
 }
@@ -104,6 +106,7 @@ func LoadConfig(filePath string) (*domain.VigiaConfig, error) {
 		ProjectName: raw.ProjectName,
 		ComposeFile: raw.ComposeFile,
 		Profiles:    raw.Profiles,
+		Links:       raw.Links,
 		Services:    raw.Services,
 		Tasks:       make(map[string]domain.TaskConfig),
 	}
@@ -146,6 +149,11 @@ func ValidateAndApplyDefaults(cfg *domain.VigiaConfig) error {
 	}
 
 	for name, svc := range cfg.Services {
+		if svc.URL != "" {
+			if err := validateNavigationURL(svc.URL); err != nil {
+				return fmt.Errorf("%w: service %q url: %w", ErrInvalidConfig, name, err)
+			}
+		}
 		if len(svc.Command) == 0 && svc.ComposeService == "" {
 			return fmt.Errorf("%w: serviço '%s' deve declarar 'command' ou 'compose_service'", ErrInvalidConfig, name)
 		}
@@ -207,6 +215,12 @@ func ValidateAndApplyDefaults(cfg *domain.VigiaConfig) error {
 		cfg.Services[name] = svc
 	}
 
+	for i, link := range cfg.Links {
+		if err := validateNavigationURL(link.URL); err != nil {
+			return fmt.Errorf("%w: links[%d] (%q) url: %w", ErrInvalidConfig, i, link.Name, err)
+		}
+	}
+
 	for name, task := range cfg.Tasks {
 		if len(task.Command) == 0 {
 			return fmt.Errorf("%w: task '%s' must declare a non-empty 'command'", ErrInvalidConfig, name)
@@ -218,6 +232,15 @@ func ValidateAndApplyDefaults(cfg *domain.VigiaConfig) error {
 		}
 	}
 
+	return nil
+}
+
+// Validate navigation at load time so all commands fail before execution.
+func validateNavigationURL(value string) error {
+	u, err := url.ParseRequestURI(value)
+	if err != nil || strings.ContainsAny(value, " \t\r\n") || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("%q must be a valid absolute http:// or https:// URL", value)
+	}
 	return nil
 }
 

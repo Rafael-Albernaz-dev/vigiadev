@@ -1,15 +1,22 @@
 package commands
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 	"github.com/spf13/cobra"
 )
 
@@ -21,6 +28,19 @@ func StopSession(cwd string) error {
 		return nil
 	}
 
+	var failures []error
+	recordSignal := func(pid int, sig syscall.Signal) {
+		if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+			failures = append(failures, fmt.Errorf("signal %d: %w", pid, err))
+		}
+	}
+	stopContainer := func(id string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if output, err := exec.CommandContext(ctx, "docker", "stop", id).CombinedOutput(); err != nil {
+			failures = append(failures, fmt.Errorf("stop container %s: %s: %w", id, output, err))
+		}
+	}
 	if m != nil {
 		fmt.Printf("⏹️ Stopping session '%s' for project '%s'...\n", m.RunID, m.ProjectName)
 	} else {
@@ -30,7 +50,7 @@ func StopSession(cwd string) error {
 	// 0. Signal the vigiaDev supervisor process if another session holds the lock
 	if lockAlive && lockPID > 1 && lockPID != os.Getpid() {
 		fmt.Printf("  • Stopping vigiaDev supervisor (PID %d)...\n", lockPID)
-		_ = syscall.Kill(lockPID, syscall.SIGTERM)
+		recordSignal(lockPID, syscall.SIGTERM)
 	}
 
 	if m != nil {
@@ -39,14 +59,14 @@ func StopSession(cwd string) error {
 		for _, cID := range m.Containers {
 			if !stoppedContainers[cID] {
 				fmt.Printf("  • Stopping container '%s'...\n", cID)
-				_ = exec.Command("docker", "stop", cID).Run()
+				stopContainer(cID)
 				stoppedContainers[cID] = true
 			}
 		}
 		for name, svc := range m.Services {
 			if svc.IsContainer && svc.ContainerID != "" && !stoppedContainers[svc.ContainerID] {
 				fmt.Printf("  • Stopping service container '%s' (%s)...\n", name, svc.ContainerID)
-				_ = exec.Command("docker", "stop", svc.ContainerID).Run()
+				stopContainer(svc.ContainerID)
 				stoppedContainers[svc.ContainerID] = true
 			}
 		}
@@ -55,9 +75,9 @@ func StopSession(cwd string) error {
 		for name, svc := range m.Services {
 			if svc.PGID > 0 {
 				fmt.Printf("  • Stopping service '%s' (PGID %d)...\n", name, svc.PGID)
-				_ = syscall.Kill(-svc.PGID, syscall.SIGTERM)
+				recordSignal(-svc.PGID, syscall.SIGTERM)
 			} else if svc.PID > 0 {
-				_ = syscall.Kill(svc.PID, syscall.SIGTERM)
+				recordSignal(svc.PID, syscall.SIGTERM)
 			}
 		}
 	}
@@ -68,21 +88,42 @@ func StopSession(cwd string) error {
 	if m != nil {
 		for _, svc := range m.Services {
 			if svc.PGID > 0 {
-				_ = syscall.Kill(-svc.PGID, syscall.SIGKILL)
+				recordSignal(-svc.PGID, syscall.SIGKILL)
 			} else if svc.PID > 0 {
-				_ = syscall.Kill(svc.PID, syscall.SIGKILL)
+				recordSignal(svc.PID, syscall.SIGKILL)
 			}
 		}
 	}
 	if lockPID > 1 && lockPID != os.Getpid() && manifest.IsPIDAlive(lockPID) {
-		_ = syscall.Kill(lockPID, syscall.SIGKILL)
+		recordSignal(lockPID, syscall.SIGKILL)
 		for i := 0; i < 10 && manifest.IsPIDAlive(lockPID); i++ {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
 
-	_ = manifest.RemoveManifest(cwd)
-	_ = manifest.ReleaseLock(cwd)
+	if m != nil {
+		deadline := time.Now().Add(time.Second)
+		for _, svc := range m.Services {
+			if svc.IsContainer {
+				continue
+			}
+			for svc.PID > 1 && manifest.IsPIDAlive(svc.PID) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if svc.PID > 1 && manifest.IsPIDAlive(svc.PID) {
+				failures = append(failures, fmt.Errorf("PID %d remains alive", svc.PID))
+			}
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
+		return err
+	}
+	if err := manifest.RemoveManifest(cwd); err != nil {
+		return err
+	}
+	if err := manifest.ReleaseLock(cwd); err != nil {
+		return err
+	}
 
 	fmt.Println("✨ All session services stopped and resources released.")
 	return nil
@@ -90,7 +131,8 @@ func StopSession(cwd string) error {
 
 var downCmd = &cobra.Command{
 	Use:   "down",
-	Short: "Stop all services in the active session and clean up resources",
+	Short: "Stop session resources, configured Compose services and residual host listeners",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -98,8 +140,10 @@ var downCmd = &cobra.Command{
 		}
 
 		targetDir := cwd
-		if cfgPath, err := config.FindConfigFile(cwd, cfgFile); err == nil {
-			targetDir = filepath.Dir(cfgPath)
+		if _, err := config.FindConfigFile(cwd, cfgFile); err == nil {
+			return DownProject(cwd, cfgFile, cmd.OutOrStdout())
+		} else if cfgFile != "" {
+			return err
 		} else {
 			curr := filepath.Clean(cwd)
 			for {
@@ -119,17 +163,84 @@ var downCmd = &cobra.Command{
 			}
 		}
 
-		_, errManifest := manifest.ReadManifest(targetDir)
-		_, lockAlive := manifest.ReadLockPID(targetDir)
-		if errManifest != nil && !lockAlive {
-			fmt.Println("ℹ️ No active vigiaDev session found (.vigiadev/run.json missing).")
-			return nil
-		}
-
-		return StopSession(targetDir)
+		return DownProject(targetDir, cfgFile, cmd.OutOrStdout())
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(downCmd)
+}
+
+// DownProject cleans configured resources even without an active manifest/lock.
+// StopSession stays scoped to tracked resources for internal restart/remove calls.
+func DownProject(cwd, explicit string, out io.Writer) error {
+	if out == nil {
+		out = os.Stdout
+	}
+	var cfg *domain.VigiaConfig
+	path, err := config.FindConfigFile(cwd, explicit)
+	if err == nil {
+		cfg, err = config.LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		cwd = filepath.Dir(path)
+	} else if explicit != "" || !errors.Is(err, config.ErrConfigNotFound) {
+		return err
+	}
+	if _, err := manifest.ReadManifest(cwd); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, alive := manifest.ReadLockPID(cwd)
+	if _, err := manifest.ReadManifest(cwd); errors.Is(err, os.ErrNotExist) && !alive {
+		fmt.Fprintln(out, "ℹ️ No active vigiaDev session; inspecting configured project resources.")
+	}
+	var failures []error
+	if err := StopSession(cwd); err != nil {
+		failures = append(failures, err)
+	}
+	if cfg == nil {
+		fmt.Fprintln(out, "ℹ️ No project configuration found; only tracked session resources were inspected.")
+		return errors.Join(failures...)
+	}
+	// Stop only declared, non-reused Compose services, never networks or volumes.
+	var names []string
+	for name := range cfg.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	seen := map[string]bool{}
+	for _, name := range names {
+		svc := cfg.Services[name]
+		if svc.ComposeService == "" || svc.PortPolicy == domain.PortPolicyReuse {
+			continue
+		}
+		file := svc.ComposeFile
+		if file == "" {
+			file = cfg.ComposeFile
+		}
+		key := file + "\x00" + svc.ComposeService
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		runner := &docker.DefaultComposeRunner{}
+		err := runner.Stop(ctx, svc.ComposeService, file, cwd)
+		cancel()
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		for _, port := range svc.Ports {
+			if !ports.NewPortResolver("").IsPortAvailable(port) {
+				failures = append(failures, fmt.Errorf("Compose service %s stopped but port %d remains occupied", svc.ComposeService, port))
+			}
+		}
+		fmt.Fprintf(out, "  • Stopped Compose service %s.\n", svc.ComposeService)
+	}
+	if err := resolveConfiguredPorts(cfg, out, true); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
 }

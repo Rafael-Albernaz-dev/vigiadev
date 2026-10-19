@@ -1,11 +1,13 @@
 package ports
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
 )
@@ -28,12 +30,24 @@ func (pr *PortResolver) IsPortAvailable(port int) bool {
 	if port < 1 || port > 65535 {
 		return false
 	}
-	addr := net.JoinHostPort(pr.Host, strconv.Itoa(port))
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return false
+	if pr.Host != "" {
+		listener, err := net.Listen("tcp", net.JoinHostPort(pr.Host, strconv.Itoa(port)))
+		if err != nil {
+			return false
+		}
+		_ = listener.Close()
+		return true
 	}
-	_ = listener.Close()
+	for _, network := range []string{"tcp4", "tcp6"} {
+		listener, err := net.Listen(network, net.JoinHostPort("", strconv.Itoa(port)))
+		if err != nil {
+			if network == "tcp6" && (errors.Is(err, syscall.EAFNOSUPPORT) || errors.Is(err, syscall.EPROTONOSUPPORT)) {
+				continue
+			}
+			return false
+		}
+		_ = listener.Close()
+	}
 	return true
 }
 

@@ -4,11 +4,78 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
+	"gopkg.in/yaml.v3"
 )
+
+func TestLoadConfig_NavigationRoundTripAndTaskPersistence(t *testing.T) {
+	content := `# navigation must survive task discovery
+version: 1
+project_name: atlas
+links:
+  - name: "Catálogo de sistemas"
+    url: http://platform.atlas.localhost:8080/systems
+services:
+  web:
+    command: [npm, run, dev:viabilidade]
+    dir: frontend
+    url: http://viabilidade.atlas.localhost:8080/
+    ports: [5175]
+    healthcheck:
+      type: tcp
+      port: 5175
+`
+	path := filepath.Join(t.TempDir(), "vigiadev.yaml")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLinks := []domain.LinkConfig{{Name: "Catálogo de sistemas", URL: "http://platform.atlas.localhost:8080/systems"}}
+	if !reflect.DeepEqual(cfg.Links, wantLinks) || cfg.Services["web"].URL != "http://viabilidade.atlas.localhost:8080/" {
+		t.Fatalf("navigation lost: %+v", cfg)
+	}
+	if cfg.Services["web"].Ports[0] != 5175 || cfg.Services["web"].HealthCheck.Port != 5175 {
+		t.Fatal("navigation changed operational ports")
+	}
+	encoded, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := config.LoadConfig(path)
+	if err != nil || !reflect.DeepEqual(cfg, roundTrip) {
+		t.Fatalf("YAML round trip lost config: %+v, %v", roundTrip, err)
+	}
+	// Exercise the real node-preserving persistence path as well.
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveDiscoveredTasks(path, map[string]domain.TaskConfig{"test": {Command: []string{"go", "test", "./..."}}}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.HasPrefix(string(updated), content) {
+		t.Fatalf("navigation nodes/comments changed during task persistence: %s, %v", updated, err)
+	}
+	loaded, err := config.LoadConfig(path)
+	if err != nil || !reflect.DeepEqual(loaded.Links, wantLinks) || loaded.Services["web"].URL != cfg.Services["web"].URL {
+		t.Fatalf("navigation lost after task persistence: %+v, %v", loaded, err)
+	}
+	legacy, err := yaml.Marshal(domain.VigiaConfig{Version: 1, ProjectName: "legacy", Services: map[string]domain.ServiceConfig{"web": {Command: []string{"true"}}}})
+	if err != nil || strings.Contains(string(legacy), "links:") || strings.Contains(string(legacy), "url:") {
+		t.Fatalf("optional navigation emitted for legacy config: %s, %v", legacy, err)
+	}
+}
 
 func TestFindConfigFile_Precedence(t *testing.T) {
 	tempDir := t.TempDir()
@@ -312,4 +379,3 @@ services:
 		t.Errorf("esperava EnvFile como slice de 2 elementos, obteve %v", viabFrontend.EnvFile)
 	}
 }
-

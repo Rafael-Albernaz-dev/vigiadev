@@ -145,6 +145,7 @@ var upCmd = &cobra.Command{
 
 			fmt.Printf("🚀 vigiadev started for project '%s' [%s]\n", cfg.ProjectName, cfgPath)
 			fmt.Printf("💡 Press Ctrl+C to stop all services.\n\n")
+			streamView.PrintLinks(cfg.Links)
 
 			if err := orch.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				return fmt.Errorf("execution stopped with error: %w", err)
@@ -183,6 +184,7 @@ var upCmd = &cobra.Command{
 		}
 
 		appModel := tui.NewAppModel(cfg.ProjectName, serviceNames, servicePorts, bus, cancel, restartFunc)
+		appModel.SetNavigation(cfg.Services, cfg.Links)
 		appModel.SetToggleFunc(toggleFunc)
 		appModel.SetStartAllFunc(startAllFunc)
 		program := tea.NewProgram(appModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -596,4 +598,3 @@ func ResolveProfilesAndServicesWithAll(cfg *domain.VigiaConfig, profile string, 
 
 	return cfg, nil
 }
-
