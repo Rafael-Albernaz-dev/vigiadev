@@ -88,7 +88,7 @@ func TestDownComposeStopAndFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			expected := dir + "\ncompose\n-f\nstack.yml\nstop\nweb\n"
+			expected := dir + "\ncompose\n-f\nstack.yml\nstop\ndb\n" + dir + "\ncompose\n-f\nstack.yml\nstop\nweb\n"
 			if string(data) != expected {
 				t.Fatalf("unsafe compose call: %q expected %q", data, expected)
 			}
@@ -97,6 +97,33 @@ func TestDownComposeStopAndFailure(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("keep_containers", func(t *testing.T) {
+		dir := t.TempDir()
+		log := filepath.Join(dir, "docker.log")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" >> \"$VIGIA_DOCKER_LOG\"\n"
+		if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		t.Setenv("VIGIA_DOCKER_LOG", log)
+		cfg := "version: 1\nproject_name: compose-test\ncompose_file: stack.yml\nservices:\n  web:\n    compose_service: web\n    port_policy: fail\n  reused:\n    compose_service: db\n    port_policy: reuse\n"
+		if err := os.WriteFile(filepath.Join(dir, "vigiadev.yaml"), []byte(cfg), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if err := commands.DownProject(dir, "", &out, true); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := dir + "\ncompose\n-f\nstack.yml\nstop\nweb\n"
+		if string(data) != expected {
+			t.Fatalf("keep-containers compose call: %q expected %q", data, expected)
+		}
+	})
 }
 
 func TestDownRelativeExplicitConfig(t *testing.T) {

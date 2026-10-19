@@ -157,10 +157,10 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | :--- | :--- |
 | `vigiadev init [--local] [-f]` | Inspects project repository and generates configuration |
 | `vigiadev up [services...] [-a] [-p profile] [-f]` | Orchestrates and boots services (all or profile subset) with interactive TUI or streaming |
-| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, supervisor PID, untracked/orphan listeners, and highlighted port conflicts |
-| `vigiadev resolve` (aliases: `clean-ports`, `resolve-ports`) | Inspects and terminates conflicting processes on project host ports, liberating sockets immediately |
+| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, Compose container states (`🐳 CONTAINER`), navigation URLs, shortcuts, and port listeners |
+| `vigiadev resolve [-a/--all]` (aliases: `clean-ports`, `resolve-ports`) | Inspects and terminates conflicting processes on project host ports; with `--all`, also stops project Compose containers |
 | `vigiadev run <task> [--no-deps]` | Executes a declared task resolving prerequisite dependencies |
-| `vigiadev down` | Shuts down active session and unconditionally terminates lingering processes on project host ports |
+| `vigiadev down [--keep-containers]` | Shuts down active session, stops project Compose services, and cleans residual host listeners |
 | `vigiadev remove [-f] [--keep-config]` | Removes `.vigiadev/` runtime data, locks, and optionally configs |
 | `vigiadev logs [service] [-f] [-n]` | Inspects or tails persisted log files in `.vigiadev/logs/` |
 | `vigiadev doctor` | Audits system requirements (Docker, Compose, ports, permissions) |

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
@@ -132,6 +135,14 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 	}
 	sort.Strings(serviceNames)
 
+	var composeServices map[string]docker.ComposeServiceStatus
+	if cfg != nil {
+		composeFile := cfg.ComposeFile
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		composeServices, _ = docker.QueryComposeServices(ctx, workDir, composeFile)
+		cancel()
+	}
+
 	resolver := ports.NewPortResolver("")
 	externalConflicts := 0
 
@@ -158,11 +169,25 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 			} else if entry.PID > 1 {
 				procState = fmt.Sprintf("EXITED (stale PID %d)", entry.PID)
 			}
+		} else if hasCfg && svcCfg.ComposeService != "" {
+			if st, ok := composeServices[svcCfg.ComposeService]; ok {
+				healthSuffix := ""
+				if st.Health != "" {
+					healthSuffix = fmt.Sprintf(", %s", st.Health)
+				}
+				if st.State == "running" {
+					procState = fmt.Sprintf("🐳 CONTAINER (%s, running%s)", st.Name, healthSuffix)
+				} else if st.State != "" {
+					procState = fmt.Sprintf("⏹️ CONTAINER (%s, %s)", st.Name, st.State)
+				}
+			}
 		}
 
 		portDetails := []string{}
 		serviceUntracked := []string{}
 		unknownUntracked := false
+		isComposeRunning := strings.HasPrefix(procState, "🐳 CONTAINER")
+
 		if hasCfg && len(svcCfg.Ports) > 0 {
 			policy := svcCfg.PortPolicy
 			if policy == "" {
@@ -173,11 +198,22 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 					portDetails = append(portDetails, fmt.Sprintf(":%d free", port))
 					continue
 				}
+				if isComposeRunning {
+					containerLabel := "docker container"
+					if st, ok := composeServices[svcCfg.ComposeService]; ok && st.Name != "" {
+						containerLabel = fmt.Sprintf("docker: %s", st.Name)
+					}
+					portDetails = append(portDetails, fmt.Sprintf(":%d active (%s)", port, containerLabel))
+					continue
+				}
 				owners, err := ports.FindProcessesByPort(port)
 				if err != nil {
 					if policy == domain.PortPolicyReuse || svcCfg.ComposeService != "" {
-						procState = "EXTERNAL / UNVERIFIED"
-						portDetails = append(portDetails, fmt.Sprintf(":%d active (external/docker, policy=%s; owner unavailable)", port, policy))
+						containerLabel := "docker container"
+						if st, ok := composeServices[svcCfg.ComposeService]; ok && st.Name != "" {
+							containerLabel = fmt.Sprintf("docker: %s", st.Name)
+						}
+						portDetails = append(portDetails, fmt.Sprintf(":%d active (%s)", port, containerLabel))
 					} else {
 						unknownUntracked = true
 						externalConflicts++
@@ -204,7 +240,9 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 				}
 				if len(untracked) > 0 {
 					if policy == domain.PortPolicyReuse || svcCfg.ComposeService != "" {
-						procState = "EXTERNAL / REUSED"
+						if procState == "STOPPED" {
+							procState = "EXTERNAL / REUSED"
+						}
 					} else {
 						externalConflicts++
 						serviceUntracked = append(serviceUntracked, untracked...)
@@ -215,13 +253,25 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 
 		if len(serviceUntracked) > 0 {
 			procState = fmt.Sprintf("🟡 UNTRACKED / ORPHAN (PID %s listening)", strings.Join(serviceUntracked, ", "))
-		} else if unknownUntracked {
+		} else if unknownUntracked && !isComposeRunning {
 			procState = "🟡 UNTRACKED (owner unavailable)"
 		}
+
+		urlSnippet := ""
+		if hasCfg && svcCfg.URL != "" {
+			urlSnippet = fmt.Sprintf(" | URL: %s", svcCfg.URL)
+		}
 		if len(portDetails) > 0 {
-			fmt.Fprintf(out, "  • %-22s %-30s | Ports: %s\n", name, procState, strings.Join(portDetails, ", "))
+			fmt.Fprintf(out, "  • %-22s %-32s | Ports: %s%s\n", name, procState, strings.Join(portDetails, ", "), urlSnippet)
 		} else {
-			fmt.Fprintf(out, "  • %-22s %s\n", name, procState)
+			fmt.Fprintf(out, "  • %-22s %-32s%s\n", name, procState, urlSnippet)
+		}
+	}
+
+	if cfg != nil && len(cfg.Links) > 0 {
+		fmt.Fprintln(out, "\n🔗 Navigation Shortcuts:")
+		for _, link := range cfg.Links {
+			fmt.Fprintf(out, "  • %-36s %s\n", link.Name, link.URL)
 		}
 	}
 

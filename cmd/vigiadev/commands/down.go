@@ -129,6 +129,8 @@ func StopSession(cwd string) error {
 	return nil
 }
 
+var keepContainers bool
+
 var downCmd = &cobra.Command{
 	Use:   "down",
 	Short: "Stop session resources, configured Compose services and residual host listeners",
@@ -139,9 +141,10 @@ var downCmd = &cobra.Command{
 			return err
 		}
 
+		keep, _ := cmd.Flags().GetBool("keep-containers")
 		targetDir := cwd
 		if _, err := config.FindConfigFile(cwd, cfgFile); err == nil {
-			return DownProject(cwd, cfgFile, cmd.OutOrStdout())
+			return DownProject(cwd, cfgFile, cmd.OutOrStdout(), keep)
 		} else if cfgFile != "" {
 			return err
 		} else {
@@ -163,20 +166,22 @@ var downCmd = &cobra.Command{
 			}
 		}
 
-		return DownProject(targetDir, cfgFile, cmd.OutOrStdout())
+		return DownProject(targetDir, cfgFile, cmd.OutOrStdout(), keep)
 	},
 }
 
 func init() {
+	downCmd.Flags().BoolVar(&keepContainers, "keep-containers", false, "Keep reusable Docker Compose containers running")
 	rootCmd.AddCommand(downCmd)
 }
 
 // DownProject cleans configured resources even without an active manifest/lock.
 // StopSession stays scoped to tracked resources for internal restart/remove calls.
-func DownProject(cwd, explicit string, out io.Writer) error {
+func DownProject(cwd, explicit string, out io.Writer, keepContainers ...bool) error {
 	if out == nil {
 		out = os.Stdout
 	}
+	keep := len(keepContainers) > 0 && keepContainers[0]
 	var cfg *domain.VigiaConfig
 	path, err := config.FindConfigFile(cwd, explicit)
 	if err == nil {
@@ -203,7 +208,7 @@ func DownProject(cwd, explicit string, out io.Writer) error {
 		fmt.Fprintln(out, "ℹ️ No project configuration found; only tracked session resources were inspected.")
 		return errors.Join(failures...)
 	}
-	// Stop only declared, non-reused Compose services, never networks or volumes.
+	// Stop declared Compose services, never networks or volumes.
 	var names []string
 	for name := range cfg.Services {
 		names = append(names, name)
@@ -212,7 +217,7 @@ func DownProject(cwd, explicit string, out io.Writer) error {
 	seen := map[string]bool{}
 	for _, name := range names {
 		svc := cfg.Services[name]
-		if svc.ComposeService == "" || svc.PortPolicy == domain.PortPolicyReuse {
+		if svc.ComposeService == "" || (keep && svc.PortPolicy == domain.PortPolicyReuse) {
 			continue
 		}
 		file := svc.ComposeFile
@@ -233,13 +238,21 @@ func DownProject(cwd, explicit string, out io.Writer) error {
 			continue
 		}
 		for _, port := range svc.Ports {
-			if !ports.NewPortResolver("").IsPortAvailable(port) {
+			available := false
+			for i := 0; i < 20; i++ {
+				if ports.NewPortResolver("").IsPortAvailable(port) {
+					available = true
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if !available {
 				failures = append(failures, fmt.Errorf("Compose service %s stopped but port %d remains occupied", svc.ComposeService, port))
 			}
 		}
 		fmt.Fprintf(out, "  • Stopped Compose service %s.\n", svc.ComposeService)
 	}
-	if err := resolveConfiguredPorts(cfg, out, true); err != nil {
+	if err := resolveConfiguredPorts(cfg, out, true, false, cwd); err != nil {
 		failures = append(failures, err)
 	}
 	return errors.Join(failures...)

@@ -718,3 +718,56 @@ func CalculateDiskIO(stats *container.StatsResponse) (uint64, uint64) {
 	}
 	return readBytes, writeBytes
 }
+
+// ComposeServiceStatus representa o estado de um container do Compose detectado via CLI.
+type ComposeServiceStatus struct {
+	Name    string
+	Service string
+	State   string // running, exited, etc.
+	Status  string // Up 5 hours (healthy)
+	Health  string // healthy, unhealthy, ""
+}
+
+// QueryComposeServices consulta os containers ativos do compose no diretório de trabalho.
+func QueryComposeServices(ctx context.Context, workDir, composeFile string) (map[string]ComposeServiceStatus, error) {
+	args := []string{"compose"}
+	if composeFile != "" {
+		args = append(args, "-f", composeFile)
+	} else if cf := FindComposeFile(workDir); cf != "" {
+		args = append(args, "-f", cf)
+	}
+	args = append(args, "ps", "-a", "--format", "json")
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Dir = workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]ComposeServiceStatus)
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item struct {
+			Service string `json:"Service"`
+			Name    string `json:"Name"`
+			State   string `json:"State"`
+			Status  string `json:"Status"`
+			Health  string `json:"Health"`
+		}
+		if err := json.Unmarshal([]byte(line), &item); err == nil && item.Service != "" {
+			result[item.Service] = ComposeServiceStatus{
+				Name:    item.Name,
+				Service: item.Service,
+				State:   strings.ToLower(item.State),
+				Status:  item.Status,
+				Health:  strings.ToLower(item.Health),
+			}
+		}
+	}
+	return result, nil
+}

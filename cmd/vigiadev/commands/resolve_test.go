@@ -165,3 +165,49 @@ func TestResolveInvalidConfigurationDoesNotKill(t *testing.T) {
 		t.Fatal("killed before config validation")
 	}
 }
+
+func TestResolveAllFlagStopsComposeAndFreesAllPorts(t *testing.T) {
+	_, port := residualChild(t, "127.0.0.1:0", false)
+	dir := t.TempDir()
+	log := filepath.Join(dir, "docker.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" >> \"$VIGIA_DOCKER_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("VIGIA_DOCKER_LOG", log)
+
+	cfg := fmt.Sprintf("version: 1\nproject_name: resolve-all-test\ncompose_file: stack.yml\nservices:\n  db:\n    compose_service: db\n    port_policy: reuse\n    ports: [%d]\n", port)
+	if err := os.WriteFile(filepath.Join(dir, "vigiadev.yaml"), []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without --all: preserves reuse/compose ports and prints hint
+	var out bytes.Buffer
+	if err := commands.ResolveProjectPorts(dir, "", &out, false); err != nil {
+		t.Fatal(err)
+	}
+	if ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("port should be preserved without --all")
+	}
+	if !strings.Contains(out.String(), "Reusable Docker Compose containers or ports are active") {
+		t.Fatalf("expected hint in output: %s", out.String())
+	}
+
+	// With --all: stops Compose service and resolves port
+	out.Reset()
+	if err := commands.ResolveProjectPorts(dir, "", &out, true); err != nil {
+		t.Fatal(err)
+	}
+	if !ports.NewPortResolver("").IsPortAvailable(port) {
+		t.Fatal("port should be freed with --all")
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := dir + "\ncompose\n-f\nstack.yml\nstop\ndb\n"
+	if string(data) != expected {
+		t.Fatalf("unexpected compose call: %q expected %q", data, expected)
+	}
+}
