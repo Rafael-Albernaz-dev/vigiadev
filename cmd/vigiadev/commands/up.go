@@ -399,7 +399,7 @@ func HandleOrReapPriorSession(workDir, projectName string, in io.Reader, out io.
 			fmt.Fprintln(out, "Operation cancelled. Run 'vigiadev status' to inspect or 'vigiadev down' to stop the active session.")
 			return false, nil
 		}
-		return false, fmt.Errorf("prior vigiadev session with PID %d is still active (run 'vigiadev status' to inspect, 'vigiadev down' to stop it, or 'vigiadev up --force' to replace it)", ownerPID)
+		return false, fmt.Errorf("prior vigiadev session with PID %d is still active (run 'vigiadev status' to inspect, 'vigiadev restart <service>' to restart a single service, 'vigiadev down' to stop it, or 'vigiadev up --force' to replace it)", ownerPID)
 	}
 	if err := ReapOrphanedProcesses(workDir, projectName); err != nil {
 		return false, err

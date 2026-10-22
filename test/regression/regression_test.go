@@ -3,6 +3,7 @@ package regression_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -486,6 +487,159 @@ services:
 	s3 := out3.String()
 	if !strings.Contains(s3, "ACTIVE") || !strings.Contains(s3, "run-active-123") {
 		t.Fatalf("expected status to report ACTIVE session and run ID, got:\n%s", s3)
+	}
+}
+
+// TestRegression_IPCControl_SingleServiceRestart_NoSessionDestruction valida que:
+// 1. O supervisor em execução expõe IPC seguro via Unix domain socket.
+// 2. Comandos CLI (vigiadev restart <service>) reiniciam exclusivamente o serviço alvo.
+// 3. Os outros serviços da sessão preservam seus PIDs intactos (zero destruição de sessão).
+// 4. Status em formato JSON reporta a saúde e portas em tempo real para automação por agentes.
+func TestRegression_IPCControl_SingleServiceRestart_NoSessionDestruction(t *testing.T) {
+	tempDir := t.TempDir()
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	cfgContent := `version: 1
+project_name: test-supervisor-control
+services:
+  database:
+    command: ["sh", "-c", "sleep 30"]
+  api:
+    command: ["sh", "-c", "sleep 30"]
+`
+	cfgPath := filepath.Join(tempDir, "vigiadev.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatalf("failed to create orchestrator: %v", err)
+	}
+	t.Cleanup(orch.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErrChan := make(chan error, 1)
+	go func() {
+		runErrChan <- orch.Run(ctx)
+	}()
+
+	// Aguarda os serviços iniciarem
+	var dbOriginalPID, apiOriginalPID int
+	for i := 0; i < 40; i++ {
+		time.Sleep(50 * time.Millisecond)
+		m, err := manifest.ReadManifest(tempDir)
+		if err == nil && m != nil && m.Services != nil {
+			dbSvc, dbOk := m.Services["database"]
+			apiSvc, apiOk := m.Services["api"]
+			if dbOk && apiOk && dbSvc.PID > 1 && apiSvc.PID > 1 {
+				dbOriginalPID = dbSvc.PID
+				apiOriginalPID = apiSvc.PID
+				break
+			}
+		}
+	}
+
+	if dbOriginalPID <= 1 || apiOriginalPID <= 1 {
+		t.Fatalf("services did not start in time: db=%d, api=%d", dbOriginalPID, apiOriginalPID)
+	}
+
+	// 1. Testa 'vigiadev status --json'
+	var statusOut bytes.Buffer
+	if err := commands.InspectProjectStatusJSON(tempDir, cfgPath, &statusOut); err != nil {
+		t.Fatalf("status JSON failed: %v", err)
+	}
+	var statusObj commands.ProjectStatusJSON
+	if err := json.Unmarshal(statusOut.Bytes(), &statusObj); err != nil {
+		t.Fatalf("failed to parse status JSON: %v", err)
+	}
+	if statusObj.Session.State != "ACTIVE" {
+		t.Fatalf("expected ACTIVE session, got: %s", statusObj.Session.State)
+	}
+	if statusObj.Services["api"].State != "healthy" {
+		t.Fatalf("expected api to be healthy, got: %s", statusObj.Services["api"].State)
+	}
+
+	// 2. Executa 'vigiadev restart api' via CLI
+	rootCmd := commands.GetRootCmd()
+	var restartOut bytes.Buffer
+	rootCmd.SetOut(&restartOut)
+	rootCmd.SetArgs([]string{"restart", "api"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("restart api command failed: %v", err)
+	}
+
+	// Aguarda atualização no manifesto pós-restart
+	var dbAfterPID, apiAfterPID int
+	for i := 0; i < 40; i++ {
+		time.Sleep(50 * time.Millisecond)
+		m, err := manifest.ReadManifest(tempDir)
+		if err == nil && m != nil && m.Services != nil {
+			dbSvc := m.Services["database"]
+			apiSvc := m.Services["api"]
+			if apiSvc.PID != apiOriginalPID && apiSvc.PID > 1 {
+				dbAfterPID = dbSvc.PID
+				apiAfterPID = apiSvc.PID
+				break
+			}
+		}
+	}
+
+	// PROVA CRÍTICA:
+	// A API deve ter um NOVO PID (reiniciada com sucesso)
+	// O Database DEVE MANTER O MESMO PID INTACTO (sessão preservada, sem up --force destrutivo)
+	if apiAfterPID == apiOriginalPID || apiAfterPID <= 1 {
+		t.Fatalf("api service was not restarted with a new PID (old: %d, new: %d)", apiOriginalPID, apiAfterPID)
+	}
+	if dbAfterPID != dbOriginalPID {
+		t.Fatalf("database service was unexpectedly restarted or destroyed! old: %d, after: %d", dbOriginalPID, dbAfterPID)
+	}
+
+	// 3. Executa 'vigiadev stop api'
+	var stopOut bytes.Buffer
+	rootCmd.SetOut(&stopOut)
+	rootCmd.SetArgs([]string{"stop", "api"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("stop api command failed: %v", err)
+	}
+
+	// Verifica se o database continua rodando
+	if !manifest.IsPIDAlive(dbOriginalPID) {
+		t.Fatalf("database unexpectedly died after stopping api")
+	}
+
+	// 4. Executa 'vigiadev start api'
+	var startOut bytes.Buffer
+	rootCmd.SetOut(&startOut)
+	rootCmd.SetArgs([]string{"start", "api"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("start api command failed: %v", err)
+	}
+
+	// Finaliza orchestrator graciosamente
+	cancel()
+	select {
+	case err := <-runErrChan:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("orchestrator returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("orchestrator failed to terminate within timeout")
 	}
 }
 

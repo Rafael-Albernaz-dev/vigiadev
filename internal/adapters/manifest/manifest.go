@@ -38,6 +38,7 @@ type RunManifest struct {
 	StartTime   time.Time                  `json:"start_time"`
 	Services    map[string]ServiceManifest `json:"services"`
 	Containers  []string                   `json:"containers,omitempty"`
+	SocketPath  string                     `json:"socket_path,omitempty"`
 }
 
 // EnsureVigiaDir garante que o diretório .vigiadev exista no caminho do projeto.

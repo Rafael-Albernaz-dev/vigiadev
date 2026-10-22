@@ -2,6 +2,7 @@ package commands_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,5 +87,27 @@ func TestStatusReuseAndFreePorts(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), fmt.Sprintf(":%d free", port)) || strings.Contains(out.String(), "UNTRACKED") {
 		t.Fatalf("free port status incorrect: %s", &out)
+	}
+}
+
+func TestStatusJSON_Output(t *testing.T) {
+	dir := t.TempDir()
+	cfg := residualConfig(t, dir, 9876, "")
+
+	var out bytes.Buffer
+	if err := commands.InspectProjectStatusJSON(dir, cfg, &out); err != nil {
+		t.Fatalf("InspectProjectStatusJSON failed: %v", err)
+	}
+
+	var statusObj commands.ProjectStatusJSON
+	if err := json.Unmarshal(out.Bytes(), &statusObj); err != nil {
+		t.Fatalf("failed to parse JSON status: %v\nOutput: %s", err, out.String())
+	}
+
+	if statusObj.Session.State != "STOPPED" {
+		t.Fatalf("expected STOPPED session state, got: %s", statusObj.Session.State)
+	}
+	if svc, ok := statusObj.Services["web"]; !ok || svc.Port != 9876 {
+		t.Fatalf("expected web service with port 9876, got: %+v", svc)
 	}
 }

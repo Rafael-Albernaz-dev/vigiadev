@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ipc"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/domain"
@@ -21,12 +23,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var statusJSON bool
+
 var statusCmd = &cobra.Command{
 	Use:          "status",
 	Aliases:      []string{"ps", "st"},
 	Short:        "Inspect active vigiadev session, service processes, and port conflicts",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		defer func() {
+			statusJSON = false
+		}()
 		cwd, err := os.Getwd()
 		if err != nil {
 			return err
@@ -36,11 +43,15 @@ var statusCmd = &cobra.Command{
 		if err == nil && cfgPath != "" {
 			workDir = filepath.Dir(cfgPath)
 		}
+		if statusJSON {
+			return InspectProjectStatusJSON(workDir, cfgPath, cmd.OutOrStdout())
+		}
 		return InspectProjectStatus(workDir, cfgPath, cmd.OutOrStdout())
 	},
 }
 
 func init() {
+	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output status in JSON format")
 	rootCmd.AddCommand(statusCmd)
 }
 
@@ -276,7 +287,7 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 	}
 
 	if lockAlive {
-		fmt.Fprintf(out, "\n💡 Active session is running (PID %d). Run 'vigiadev down' to stop it, or 'vigiadev up --force' to restart.\n", lockPID)
+		fmt.Fprintf(out, "\n💡 Active session is running (PID %d). Use 'vigiadev restart <service>' to reload a service, 'vigiadev down' to stop it, or 'vigiadev up --force' to restart everything.\n", lockPID)
 	}
 	if externalConflicts > 0 {
 		alert := strings.Join([]string{
@@ -292,4 +303,208 @@ func InspectProjectStatus(workDir, cfgPath string, out io.Writer) error {
 	}
 
 	return nil
+}
+
+type ProjectStatusJSON struct {
+	Project    string                       `json:"project"`
+	WorkDir    string                       `json:"work_dir"`
+	ConfigPath string                       `json:"config_path,omitempty"`
+	Session    SessionStatusJSON            `json:"session"`
+	Services   map[string]ServiceStatusJSON `json:"services"`
+	Links      map[string]string            `json:"links,omitempty"`
+}
+
+type SessionStatusJSON struct {
+	State         string `json:"state"`
+	SupervisorPID int    `json:"supervisor_pid,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
+	SocketPath    string `json:"socket_path,omitempty"`
+}
+
+type ServiceStatusJSON struct {
+	Name         string   `json:"name"`
+	State        string   `json:"state"`
+	Type         string   `json:"type"`
+	PID          int      `json:"pid,omitempty"`
+	PGID         int      `json:"pgid,omitempty"`
+	ContainerID  string   `json:"container_id,omitempty"`
+	Port         int      `json:"port,omitempty"`
+	Ports        []int    `json:"ports,omitempty"`
+	OriginalPort int      `json:"original_port,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	Command      []string `json:"command,omitempty"`
+	Detail       string   `json:"detail,omitempty"`
+}
+
+// InspectProjectStatusJSON returns structured JSON status of the project and running session.
+func InspectProjectStatusJSON(workDir, cfgPath string, out io.Writer) error {
+	if out == nil {
+		out = os.Stdout
+	}
+
+	var cfg *domain.VigiaConfig
+	if cfgPath != "" {
+		loaded, err := config.LoadConfig(cfgPath)
+		if err != nil {
+			return fmt.Errorf("failed to load configuration %q: %w", cfgPath, err)
+		}
+		cfg = loaded
+	}
+
+	m, _ := manifest.ReadManifest(workDir)
+	lockPID, lockAlive := manifest.ReadLockPID(workDir)
+
+	projectName := filepath.Base(workDir)
+	if cfg != nil && cfg.ProjectName != "" {
+		projectName = cfg.ProjectName
+	} else if m != nil && m.ProjectName != "" {
+		projectName = m.ProjectName
+	}
+
+	sessionState := "STOPPED"
+	runID := ""
+	if m != nil && m.RunID != "" {
+		runID = m.RunID
+	}
+
+	aliveManifestSvcs := 0
+	if m != nil {
+		for _, entry := range m.Services {
+			if !entry.IsContainer && entry.PID > 1 && manifest.IsPIDAlive(entry.PID) {
+				aliveManifestSvcs++
+			}
+		}
+	}
+
+	switch {
+	case lockAlive:
+		sessionState = "ACTIVE"
+	case m != nil && aliveManifestSvcs > 0:
+		sessionState = "ORPHANED"
+	case m != nil || lockPID > 0:
+		sessionState = "STALE"
+	default:
+		sessionState = "STOPPED"
+	}
+
+	socketPath := ipc.ResolveSocketPath(workDir)
+	if m != nil && m.SocketPath != "" {
+		socketPath = m.SocketPath
+	}
+
+	statusObj := ProjectStatusJSON{
+		Project:    projectName,
+		WorkDir:    workDir,
+		ConfigPath: cfgPath,
+		Session: SessionStatusJSON{
+			State:         sessionState,
+			SupervisorPID: lockPID,
+			RunID:         runID,
+			SocketPath:    socketPath,
+		},
+		Services: make(map[string]ServiceStatusJSON),
+	}
+
+	if cfg != nil && len(cfg.Links) > 0 {
+		statusObj.Links = make(map[string]string)
+		for _, l := range cfg.Links {
+			statusObj.Links[l.Name] = l.URL
+		}
+	}
+
+	// If session is active, try to query live status from IPC
+	var liveServices map[string]ipc.ServiceStatusInfo
+	if lockAlive {
+		client := ipc.NewClient(socketPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := client.SendCommand(ctx, ipc.Request{Action: ipc.ActionStatus})
+		cancel()
+		if err == nil && resp != nil && resp.OK {
+			liveServices = resp.Services
+		}
+	}
+
+	// Build service set
+	serviceSet := make(map[string]bool)
+	if cfg != nil {
+		for name := range cfg.Services {
+			serviceSet[name] = true
+		}
+	}
+	if m != nil {
+		for name := range m.Services {
+			serviceSet[name] = true
+		}
+	}
+	for name := range liveServices {
+		serviceSet[name] = true
+	}
+
+	for name := range serviceSet {
+		svcJSON := ServiceStatusJSON{
+			Name:  name,
+			State: "stopped",
+			Type:  "process",
+		}
+
+		if cfg != nil {
+			if svcCfg, ok := cfg.Services[name]; ok {
+				svcJSON.URL = svcCfg.URL
+				svcJSON.Ports = svcCfg.Ports
+				svcJSON.Command = svcCfg.Command
+				if len(svcCfg.Ports) > 0 {
+					svcJSON.Port = svcCfg.Ports[0]
+					svcJSON.OriginalPort = svcCfg.Ports[0]
+				}
+				if svcCfg.ComposeService != "" {
+					svcJSON.Type = "container"
+				}
+			}
+		}
+
+		if m != nil {
+			if entry, ok := m.Services[name]; ok {
+				if entry.Port > 0 {
+					svcJSON.Port = entry.Port
+				}
+				svcJSON.PID = entry.PID
+				svcJSON.PGID = entry.PGID
+				svcJSON.ContainerID = entry.ContainerID
+				if entry.IsContainer {
+					svcJSON.Type = "container"
+				}
+				if entry.PID > 1 && manifest.IsPIDAlive(entry.PID) {
+					svcJSON.State = "running"
+				}
+			}
+		}
+
+		if liveInfo, ok := liveServices[name]; ok {
+			svcJSON.State = liveInfo.State
+			if liveInfo.Port > 0 {
+				svcJSON.Port = liveInfo.Port
+			}
+			if liveInfo.PID > 0 {
+				svcJSON.PID = liveInfo.PID
+			}
+			if liveInfo.PGID > 0 {
+				svcJSON.PGID = liveInfo.PGID
+			}
+			if liveInfo.ContainerID != "" {
+				svcJSON.ContainerID = liveInfo.ContainerID
+			}
+			if liveInfo.IsContainer {
+				svcJSON.Type = "container"
+			}
+			if liveInfo.Detail != "" {
+				svcJSON.Detail = liveInfo.Detail
+			}
+		}
+
+		statusObj.Services[name] = svcJSON
+	}
+
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(statusObj)
 }

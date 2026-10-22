@@ -17,6 +17,8 @@
 
 - **⚡ Native Go Binary**: Standalone static binary (~12MB), zero runtime dependencies, instant boot (<2ms).
 - **🧭 Deterministic DAG Orchestration**: Resolves service dependencies via Kahn's topological sort algorithm, running independent services in concurrent execution waves.
+- **🎮 Supervisor IPC & Granular Lifecycle Control (`vigiadev restart`, `stop`, `start`)**: Native Unix Domain Socket IPC interface (`.vigiadev/ipc.sock`) running inside the supervisor. Allows developers, CI scripts, and autonomous AI agents to surgically restart, stop, or start individual services on demand without destroying the active session or restarting databases and sibling processes.
+- **🤖 Agent & Automation First-Class Ergonomics (`--json`)**: Machine-readable JSON output for `vigiadev status --json`, `restart --json`, `stop --json`, and `start --json`, delivering structured payloads with deterministic Unix exit codes for seamless AI pair programming and tooling integration.
 - **📦 Deep Monorepo & Modular Stack Detection**: Automatically discovers nested modular apps (`backend/apps/*`, `frontend/apps/*`, npm/pnpm/yarn/bun workspaces) with dedicated execution directories (`dir:`). Interspects real backend ports from Vite proxy configs, manifests, or source code, automatically wires DAG dependencies (`depends_on: [<module>-backend]`), and synthesizes declarative execution profiles.
 - **🛡️ Strict Safety & Teardown Model**: Never runs destructive commands (`docker compose down`, `kill -9`) without explicit policy. Tracks every PID, PGID, working directory, and Container ID in `.vigiadev/run.json` with immediate spawn persistence. Automatically cleans up stale/orphaned processes across subdirectories on `vigiadev up` while preserving external workloads.
 - **🖥️ Interactive Charm.sh TUI**: Rich terminal interface powered by Bubble Tea, Lip Gloss, and Bubbles:
@@ -117,7 +119,29 @@ vigiadev up -a --force
 vigiadev up --no-tui
 ```
 
-### 4. Stop and Clean
+### 4. Granular Service Control & Agent Automation (IPC)
+
+When vigiaDev is running (in TUI, in background, or in `--no-tui` mode), you or an autonomous AI agent can surgically control individual services without tearing down databases or other dependencies:
+
+```bash
+# Restart only the backend service (preserves Postgres, Redis, and sibling services):
+vigiadev restart backend
+
+# Output structured JSON (ideal for AI coding agents & scripts):
+vigiadev restart backend --json
+
+# Restart all services via supervisor IPC:
+vigiadev restart --all
+
+# Inspect real-time status in structured JSON:
+vigiadev status --json
+
+# Stop or start individual services on demand:
+vigiadev stop backend
+vigiadev start backend
+```
+
+### 5. Stop and Clean
 
 ```bash
 # Graceful teardown of active session resources (services, process groups, and supervisor):
@@ -157,7 +181,10 @@ When running `vigiadev up`, the interactive TUI provides full control:
 | :--- | :--- |
 | `vigiadev init [--local] [-f]` | Inspects project repository and generates configuration |
 | `vigiadev up [services...] [-a] [-p profile] [-f]` | Orchestrates and boots services (all or profile subset) with interactive TUI or streaming |
-| `vigiadev status` (aliases: `ps`, `st`) | Inspects active session, Compose container states (`🐳 CONTAINER`), navigation URLs, shortcuts, and port listeners |
+| `vigiadev restart [services...] [-a] [--json] [-t]` | Surgically restarts one or more services in the active session via supervisor IPC |
+| `vigiadev stop [services...] [-a] [--json]` | Stops one or more services in the active session via supervisor IPC |
+| `vigiadev start [services...] [-a] [--json]` | Starts one or more services in the active session via supervisor IPC |
+| `vigiadev status [--json]` (aliases: `ps`, `st`) | Inspects active session, Compose container states (`🐳 CONTAINER`), navigation URLs, shortcuts, and port listeners |
 | `vigiadev resolve [-a/--all]` (aliases: `clean-ports`, `resolve-ports`) | Inspects and terminates conflicting processes on project host ports; with `--all`, also stops project Compose containers |
 | `vigiadev run <task> [--no-deps]` | Executes a declared task resolving prerequisite dependencies |
 | `vigiadev down [--keep-containers]` | Shuts down active session, stops project Compose services, and cleans residual host listeners |

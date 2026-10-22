@@ -14,6 +14,7 @@ import (
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/config"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/health"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ipc"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/process"
@@ -39,6 +40,9 @@ type Orchestrator struct {
 	AllowPortKill     bool
 	InitialPortRemaps []domain.PortRemapped
 	manifest          *manifest.RunManifest
+	ipcServer         *ipc.Server
+	serviceStates     map[string]domain.ServiceState
+	serviceDetails    map[string]string
 	mu                sync.Mutex
 	closeLogs         func()
 	closeOnce         sync.Once
@@ -177,7 +181,22 @@ func NewOrchestrator(cfg *domain.VigiaConfig, workDir string, bus *domain.EventB
 			StartTime:   time.Now(),
 			Services:    make(map[string]manifest.ServiceManifest),
 		},
+		serviceStates:  make(map[string]domain.ServiceState),
+		serviceDetails: make(map[string]string),
 	}
+
+	for name := range cfg.Services {
+		orch.serviceStates[name] = domain.StatePending
+	}
+
+	bus.Subscribe(func(event domain.Event) {
+		if st, ok := event.(domain.ServiceStateChanged); ok {
+			orch.mu.Lock()
+			orch.serviceStates[st.Service] = st.NewState
+			orch.serviceDetails[st.Service] = st.Detail
+			orch.mu.Unlock()
+		}
+	})
 
 	// Inicializa File Watching se algum serviço habilitou watch
 	var hasWatch bool
@@ -333,6 +352,9 @@ func (o *Orchestrator) SetDockerManager(dm *docker.DockerManager) {
 // Close stops owned background resources and waits for pending log writes.
 func (o *Orchestrator) Close() {
 	o.closeOnce.Do(func() {
+		if o.ipcServer != nil {
+			_ = o.ipcServer.Close()
+		}
 		if o.Watcher != nil {
 			_ = o.Watcher.Close()
 		}
@@ -369,6 +391,17 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 		return res
 	})
+
+	// Inicia servidor IPC para controle do supervisor por agentes e CLI
+	socketPath := ipc.ResolveSocketPath(o.WorkDir)
+	ipcServer := ipc.NewServer(socketPath, o)
+	if err := ipcServer.Start(ctx); err == nil {
+		o.ipcServer = ipcServer
+		o.mu.Lock()
+		o.manifest.SocketPath = socketPath
+		_ = manifest.WriteManifest(o.WorkDir, o.manifest)
+		o.mu.Unlock()
+	}
 
 	// 2. Executa onda por onda do DAG
 	for waveIdx, wave := range o.DAG.Waves {
@@ -795,6 +828,17 @@ func (o *Orchestrator) RestartService(ctx context.Context, name string) error {
 	// 1. Encerra o processo atual no supervisor
 	_ = o.Supervisor.StopProcess(name, 2*time.Second)
 
+	// Aguarda breve liberação de porta pelo SO para evitar colisão espúria
+	if len(svc.Ports) > 0 && svc.PortPolicy != domain.PortPolicyReuse {
+		origPort := svc.Ports[0]
+		for i := 0; i < 40; i++ {
+			if o.Ports.IsPortAvailable(origPort) {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+
 	// 2. Inicia novamente com alocação e healthcheck
 	if err := o.startService(ctx, name, svc); err != nil {
 		return fmt.Errorf("falha ao reiniciar serviço '%s': %w", name, err)
@@ -1088,4 +1132,209 @@ func (o *Orchestrator) RunTask(ctx context.Context, taskName string, extraArgs [
 	}
 
 	return 0, nil
+}
+
+// GetServiceState retorna o estado de máquina de estados atual de um serviço.
+func (o *Orchestrator) GetServiceState(name string) domain.ServiceState {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if st, ok := o.serviceStates[name]; ok {
+		return st
+	}
+	return domain.StatePending
+}
+
+// GetServiceStatuses retorna um mapa com o status de todos os serviços conhecidos pelo orquestrador.
+func (o *Orchestrator) GetServiceStatuses(ctx context.Context) map[string]ipc.ServiceStatusInfo {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	res := make(map[string]ipc.ServiceStatusInfo)
+	for name, svc := range o.Config.Services {
+		info := ipc.ServiceStatusInfo{
+			Name:   name,
+			State:  string(domain.StatePending),
+			URL:    svc.URL,
+			Detail: o.serviceDetails[name],
+		}
+		if st, ok := o.serviceStates[name]; ok {
+			info.State = string(st)
+		}
+		if len(svc.Ports) > 0 {
+			info.OriginalPort = svc.Ports[0]
+			info.Port = svc.Ports[0]
+		}
+		if o.manifest != nil && o.manifest.Services != nil {
+			if entry, ok := o.manifest.Services[name]; ok {
+				if entry.Port > 0 {
+					info.Port = entry.Port
+				}
+				info.PID = entry.PID
+				info.PGID = entry.PGID
+				info.ContainerID = entry.ContainerID
+				info.IsContainer = entry.IsContainer
+			}
+		}
+		res[name] = info
+	}
+	return res
+}
+
+// HandleRequest processes IPC commands received from CLI or external agents.
+func (o *Orchestrator) HandleRequest(ctx context.Context, req ipc.Request) ipc.Response {
+	switch req.Action {
+	case ipc.ActionPing:
+		return ipc.Response{
+			OK:      true,
+			Message: "pong",
+			Data: map[string]interface{}{
+				"run_id":       o.RunID,
+				"project_name": o.Config.ProjectName,
+				"pid":          os.Getpid(),
+			},
+		}
+
+	case ipc.ActionRestart:
+		target := strings.TrimSpace(req.Service)
+		if target == "" || strings.EqualFold(target, "all") {
+			o.Bus.Publish(domain.LogLineProduced{
+				BaseEvent: domain.NewBaseEvent(),
+				Service:   "ALL",
+				Line:      "[vigiadev] IPC: Restarting all services in DAG order...",
+				IsError:   false,
+			})
+			for _, svc := range o.DAG.LinearOrder {
+				if err := o.RestartService(ctx, svc); err != nil {
+					return ipc.Response{
+						OK:      false,
+						Service: svc,
+						Error:   fmt.Sprintf("failed to restart service '%s': %v", svc, err),
+						State:   string(o.GetServiceState(svc)),
+					}
+				}
+			}
+			return ipc.Response{
+				OK:      true,
+				Message: "All services restarted successfully",
+			}
+		}
+
+		if _, exists := o.Config.Services[target]; !exists {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   fmt.Sprintf("service '%s' not found", target),
+			}
+		}
+
+		if err := o.RestartService(ctx, target); err != nil {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   err.Error(),
+				State:   string(o.GetServiceState(target)),
+			}
+		}
+
+		return ipc.Response{
+			OK:      true,
+			Service: target,
+			State:   string(o.GetServiceState(target)),
+			Message: fmt.Sprintf("Service '%s' restarted successfully", target),
+		}
+
+	case ipc.ActionStop:
+		target := strings.TrimSpace(req.Service)
+		if target == "" || strings.EqualFold(target, "all") {
+			for i := len(o.DAG.LinearOrder) - 1; i >= 0; i-- {
+				svc := o.DAG.LinearOrder[i]
+				_ = o.StopService(ctx, svc)
+			}
+			return ipc.Response{
+				OK:      true,
+				Message: "All services stopped successfully",
+			}
+		}
+
+		if _, exists := o.Config.Services[target]; !exists {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   fmt.Sprintf("service '%s' not found", target),
+			}
+		}
+
+		if err := o.StopService(ctx, target); err != nil {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   err.Error(),
+				State:   string(o.GetServiceState(target)),
+			}
+		}
+
+		return ipc.Response{
+			OK:      true,
+			Service: target,
+			State:   string(domain.StateStopped),
+			Message: fmt.Sprintf("Service '%s' stopped successfully", target),
+		}
+
+	case ipc.ActionStart:
+		target := strings.TrimSpace(req.Service)
+		if target == "" || strings.EqualFold(target, "all") {
+			if err := o.StartAllServices(ctx); err != nil {
+				return ipc.Response{
+					OK:    false,
+					Error: err.Error(),
+				}
+			}
+			return ipc.Response{
+				OK:      true,
+				Message: "All services started successfully",
+			}
+		}
+
+		if _, exists := o.Config.Services[target]; !exists {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   fmt.Sprintf("service '%s' not found", target),
+			}
+		}
+
+		if err := o.StartService(ctx, target); err != nil {
+			return ipc.Response{
+				OK:      false,
+				Service: target,
+				Error:   err.Error(),
+				State:   string(o.GetServiceState(target)),
+			}
+		}
+
+		return ipc.Response{
+			OK:      true,
+			Service: target,
+			State:   string(o.GetServiceState(target)),
+			Message: fmt.Sprintf("Service '%s' started successfully", target),
+		}
+
+	case ipc.ActionStatus:
+		services := o.GetServiceStatuses(ctx)
+		return ipc.Response{
+			OK:       true,
+			Services: services,
+			Data: map[string]interface{}{
+				"run_id":       o.RunID,
+				"project_name": o.Config.ProjectName,
+				"pid":          os.Getpid(),
+			},
+		}
+
+	default:
+		return ipc.Response{
+			OK:    false,
+			Error: fmt.Sprintf("unknown action '%s'", req.Action),
+		}
+	}
 }

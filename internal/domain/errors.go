@@ -10,6 +10,7 @@ var (
 	ErrCircularDependency = errors.New("circular dependency detected in DAG")
 	ErrStaleLockDetected  = errors.New("previous session terminated abruptly (stale lock detected)")
 	ErrSessionLocked      = errors.New("another vigiaDev instance is already running in this directory")
+	ErrNoActiveSession    = errors.New("no active vigiaDev session found")
 )
 
 // PortConflictError describes a host port conflict.

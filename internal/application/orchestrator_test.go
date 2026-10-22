@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/docker"
+	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ipc"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/manifest"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/adapters/ports"
 	"github.com/Rafael-Albernaz-dev/vigiadev/internal/application"
@@ -1152,6 +1153,75 @@ func TestOrchestrator_LayeredEnvIntegration(t *testing.T) {
 	}
 	if !strings.Contains(content, "SHARED_VAR=overridden_by_yaml") {
 		t.Errorf("expected SHARED_VAR=overridden_by_yaml, got:\n%s", content)
+	}
+}
+
+func TestOrchestrator_IPCHandler(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &domain.VigiaConfig{
+		ProjectName: "ipc-test-project",
+		Services: map[string]domain.ServiceConfig{
+			"worker": {
+				Command: []string{"sh", "-c", "sleep 10"},
+			},
+		},
+	}
+
+	bus := domain.NewEventBus()
+	orch, err := application.NewOrchestrator(cfg, tempDir, bus)
+	if err != nil {
+		t.Fatalf("failed to create orchestrator: %v", err)
+	}
+	t.Cleanup(orch.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = orch.Run(ctx)
+	}()
+
+	// Wait for worker to start
+	time.Sleep(200 * time.Millisecond)
+
+	// 1. Ping
+	pingResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionPing})
+	if !pingResp.OK || pingResp.Message != "pong" {
+		t.Fatalf("unexpected ping response: %+v", pingResp)
+	}
+
+	// 2. Status
+	statusResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionStatus})
+	if !statusResp.OK || len(statusResp.Services) == 0 {
+		t.Fatalf("unexpected status response: %+v", statusResp)
+	}
+	if svc, ok := statusResp.Services["worker"]; !ok || svc.State != string(domain.StateHealthy) {
+		t.Fatalf("expected worker to be healthy, got: %+v", svc)
+	}
+
+	// 3. Restart existing service
+	restartResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionRestart, Service: "worker"})
+	if !restartResp.OK || restartResp.Service != "worker" {
+		t.Fatalf("unexpected restart response: %+v", restartResp)
+	}
+
+	// 4. Restart unknown service
+	unknownResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionRestart, Service: "nonexistent"})
+	if unknownResp.OK || !strings.Contains(unknownResp.Error, "not found") {
+		t.Fatalf("expected error for nonexistent service, got: %+v", unknownResp)
+	}
+
+	// 5. Stop service
+	stopResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionStop, Service: "worker"})
+	if !stopResp.OK || stopResp.State != string(domain.StateStopped) {
+		t.Fatalf("unexpected stop response: %+v", stopResp)
+	}
+
+	// 6. Start service
+	startResp := orch.HandleRequest(ctx, ipc.Request{Action: ipc.ActionStart, Service: "worker"})
+	if !startResp.OK || startResp.State != string(domain.StateHealthy) {
+		t.Fatalf("unexpected start response: %+v", startResp)
 	}
 }
 
